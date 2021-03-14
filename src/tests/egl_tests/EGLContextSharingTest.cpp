@@ -13,6 +13,7 @@
 #include "test_utils/gl_raii.h"
 #include "util/EGLWindow.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -152,15 +153,13 @@ TEST_P(EGLContextSharingTest, DisplayShareGroupObjectSharing)
     ASSERT_EGL_SUCCESS();
 
     // Create a texture and buffer in ctx 0
-    GLuint textureFromCtx0 = 0;
-    glGenTextures(1, &textureFromCtx0);
+    GLTexture textureFromCtx0;
     glBindTexture(GL_TEXTURE_2D, textureFromCtx0);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glBindTexture(GL_TEXTURE_2D, 0);
     ASSERT_GL_TRUE(glIsTexture(textureFromCtx0));
 
-    GLuint bufferFromCtx0 = 0;
-    glGenBuffers(1, &bufferFromCtx0);
+    GLBuffer bufferFromCtx0;
     glBindBuffer(GL_ARRAY_BUFFER, bufferFromCtx0);
     glBufferData(GL_ARRAY_BUFFER, 1, nullptr, GL_STATIC_DRAW);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -175,12 +174,10 @@ TEST_P(EGLContextSharingTest, DisplayShareGroupObjectSharing)
     ASSERT_GL_TRUE(glIsTexture(textureFromCtx0));
 
     ASSERT_GL_FALSE(glIsBuffer(bufferFromCtx0));
-    glDeleteBuffers(1, &bufferFromCtx0);
     ASSERT_GL_NO_ERROR();
 
     // Call readpixels on the texture to verify that the backend has proper support
-    GLuint fbo = 0;
-    glGenFramebuffers(1, &fbo);
+    GLFramebuffer fbo;
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureFromCtx0, 0);
 
@@ -188,19 +185,9 @@ TEST_P(EGLContextSharingTest, DisplayShareGroupObjectSharing)
     glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
     ASSERT_GL_NO_ERROR();
 
-    glDeleteFramebuffers(1, &fbo);
-
-    glDeleteTextures(1, &textureFromCtx0);
-    ASSERT_GL_NO_ERROR();
-    ASSERT_GL_FALSE(glIsTexture(textureFromCtx0));
-
     // Switch back to context 0 and delete the buffer
     ASSERT_EGL_TRUE(eglMakeCurrent(display, surface, surface, mContexts[0]));
     ASSERT_EGL_SUCCESS();
-
-    ASSERT_GL_TRUE(glIsBuffer(bufferFromCtx0));
-    glDeleteBuffers(1, &bufferFromCtx0);
-    ASSERT_GL_NO_ERROR();
 }
 
 // Tests that shared textures using EGL_ANGLE_display_texture_share_group are released when the last
@@ -227,8 +214,7 @@ TEST_P(EGLContextSharingTest, DisplayShareGroupReleasedWithLastContext)
 
     // Create a texture and buffer in ctx 0
     ASSERT_EGL_TRUE(eglMakeCurrent(display, surface, surface, mContexts[0]));
-    GLuint textureFromCtx0 = 0;
-    glGenTextures(1, &textureFromCtx0);
+    GLTexture textureFromCtx0;
     glBindTexture(GL_TEXTURE_2D, textureFromCtx0);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -375,6 +361,8 @@ TEST_P(EGLContextSharingTest, SamplerLifetime)
 TEST_P(EGLContextSharingTest, DeleteReaderOfSharedTexture)
 {
     ANGLE_SKIP_TEST_IF(!platformSupportsMultithreading());
+    // GL Fences require GLES 3.0+
+    ANGLE_SKIP_TEST_IF(getClientMajorVersion() < 3);
 
     // Initialize contexts
     EGLWindow *window = getEGLWindow();
@@ -438,6 +426,8 @@ TEST_P(EGLContextSharingTest, DeleteReaderOfSharedTexture)
     // Synchronization tools to ensure the two threads are interleaved as designed by this test.
     std::mutex mutex;
     std::condition_variable condVar;
+    std::atomic<GLsync> deletingThreadSyncObj;
+    std::atomic<GLsync> continuingThreadSyncObj;
 
     enum class Step
     {
@@ -513,15 +503,24 @@ TEST_P(EGLContextSharingTest, DeleteReaderOfSharedTexture)
         // Draw using the shared texture.
         drawQuad(program[0].get(), essl1_shaders::PositionAttrib(), 0.5f);
 
+        deletingThreadSyncObj = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        ASSERT_GL_NO_ERROR();
+        // Force the fence to be created
+        glFlush();
+
         // Wait for the other thread to also draw using the shared texture.
         nextStep(Step::Thread0Draw);
         ASSERT_TRUE(waitForStep(Step::Thread1Draw));
 
+        ASSERT_TRUE(continuingThreadSyncObj != nullptr);
+        glWaitSync(continuingThreadSyncObj, 0, GL_TIMEOUT_IGNORED);
+        ASSERT_GL_NO_ERROR();
+        glDeleteSync(continuingThreadSyncObj);
+        ASSERT_GL_NO_ERROR();
+        continuingThreadSyncObj = nullptr;
+
         // Delete this thread's framebuffer (reader of the shared texture).
         fbo[0].reset();
-
-        // Flush to make sure the graph nodes associated with this context are deleted.
-        glFlush();
 
         // Wait for the other thread to use the shared texture again before unbinding the
         // context (so no implicit flush happens).
@@ -542,8 +541,20 @@ TEST_P(EGLContextSharingTest, DeleteReaderOfSharedTexture)
         // Wait for first thread to draw using the shared texture.
         ASSERT_TRUE(waitForStep(Step::Thread0Draw));
 
+        ASSERT_TRUE(deletingThreadSyncObj != nullptr);
+        glWaitSync(deletingThreadSyncObj, 0, GL_TIMEOUT_IGNORED);
+        ASSERT_GL_NO_ERROR();
+        glDeleteSync(deletingThreadSyncObj);
+        ASSERT_GL_NO_ERROR();
+        deletingThreadSyncObj = nullptr;
+
         // Draw using the shared texture.
         drawQuad(program[0].get(), essl1_shaders::PositionAttrib(), 0.5f);
+
+        continuingThreadSyncObj = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        ASSERT_GL_NO_ERROR();
+        // Force the fence to be created
+        glFlush();
 
         // Wait for the other thread to delete its framebuffer.
         nextStep(Step::Thread1Draw);
@@ -581,10 +592,12 @@ TEST_P(EGLContextSharingTest, DeleteReaderOfSharedTexture)
 }
 }  // anonymous namespace
 
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(EGLContextSharingTest);
 ANGLE_INSTANTIATE_TEST(EGLContextSharingTest,
                        ES2_D3D9(),
                        ES2_D3D11(),
                        ES3_D3D11(),
+                       ES2_METAL(),
                        ES2_OPENGL(),
                        ES3_OPENGL(),
                        ES2_VULKAN(),

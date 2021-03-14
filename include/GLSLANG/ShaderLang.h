@@ -26,7 +26,7 @@
 
 // Version number for shader translation API.
 // It is incremented every time the API changes.
-#define ANGLE_SH_VERSION 228
+#define ANGLE_SH_VERSION 254
 
 enum ShShaderSpec
 {
@@ -38,6 +38,8 @@ enum ShShaderSpec
 
     SH_GLES3_1_SPEC,
     SH_WEBGL3_SPEC,
+
+    SH_GLES3_2_SPEC,
 
     SH_GL_CORE_SPEC,
     SH_GL_COMPATIBILITY_SPEC,
@@ -67,12 +69,11 @@ enum ShShaderOutput
     SH_HLSL_4_1_OUTPUT       = 0x8B49,  // D3D 11
     SH_HLSL_4_0_FL9_3_OUTPUT = 0x8B4A,  // D3D 11 feature level 9_3
 
-    // Output specialized GLSL to be fed to glslang for Vulkan SPIR.
-    SH_GLSL_VULKAN_OUTPUT = 0x8B4B,
+    // Output SPIR-V for the Vulkan backend.
+    SH_SPIRV_VULKAN_OUTPUT = 0x8B4B,
 
-    // Output specialized GLSL to be fed to glslang for Vulkan SPIR to be cross compiled to Metal
-    // later.
-    SH_GLSL_METAL_OUTPUT = 0x8B4C,
+    // Output SPIR-V to be cross compiled to Metal.
+    SH_SPIRV_METAL_OUTPUT = 0x8B4C,
 };
 
 // Compile options.
@@ -303,9 +304,7 @@ const ShCompileOptions SH_TAKE_VIDEO_TEXTURE_AS_EXTERNAL_OES = UINT64_C(1) << 45
 // If requested, validates the AST after every transformation.  Useful for debugging.
 const ShCompileOptions SH_VALIDATE_AST = UINT64_C(1) << 46;
 
-// Use old version of RewriteStructSamplers, which doesn't produce as many
-// sampler arrays in parameters. This causes a few tests to pass on Android.
-const ShCompileOptions SH_USE_OLD_REWRITE_STRUCT_SAMPLERS = UINT64_C(1) << 47;
+// Bit 47 is available
 
 // This flag works around a inconsistent behavior in Mac AMD driver where gl_VertexID doesn't
 // include base vertex value. It replaces gl_VertexID with (gl_VertexID + angle_BaseVertex)
@@ -315,9 +314,8 @@ const ShCompileOptions SH_ADD_BASE_VERTEX_TO_VERTEX_ID = UINT64_C(1) << 48;
 // This works around the dynamic lvalue indexing of swizzled vectors on various platforms.
 const ShCompileOptions SH_REMOVE_DYNAMIC_INDEXING_OF_SWIZZLED_VECTOR = UINT64_C(1) << 49;
 
-// This flag works a driver bug that fails to allocate ShaderResourceView for StructuredBuffer
-// on Windows 7 and earlier.
-const ShCompileOptions SH_DONT_TRANSLATE_UNIFORM_BLOCK_TO_STRUCTUREDBUFFER = UINT64_C(1) << 50;
+// This flag works around a slow fxc compile performance issue with dynamic uniform indexing.
+const ShCompileOptions SH_ALLOW_TRANSLATE_UNIFORM_BLOCK_TO_STRUCTUREDBUFFER = UINT64_C(1) << 50;
 
 // This flag indicates whether Bresenham line raster emulation code should be generated.  This
 // emulation is necessary if the backend uses a differnet algorithm to draw lines.  Currently only
@@ -338,6 +336,26 @@ const ShCompileOptions SH_IGNORE_PRECISION_QUALIFIERS = UINT64_C(1) << 54;
 
 // Allow compiler to do early fragment tests as an optimization.
 const ShCompileOptions SH_EARLY_FRAGMENT_TESTS_OPTIMIZATION = UINT64_C(1) << 55;
+
+// Allow compiler to insert Android pre-rotation code.
+const ShCompileOptions SH_ADD_PRE_ROTATION = UINT64_C(1) << 56;
+
+const ShCompileOptions SH_FORCE_SHADER_PRECISION_HIGHP_TO_MEDIUMP = UINT64_C(1) << 57;
+
+// Allow compiler to use specialization constant to do pre-rotation and y flip.
+const ShCompileOptions SH_USE_SPECIALIZATION_CONSTANT = UINT64_C(1) << 58;
+
+// Ask compiler to generate Vulkan transform feedback emulation support code.
+const ShCompileOptions SH_ADD_VULKAN_XFB_EMULATION_SUPPORT_CODE = UINT64_C(1) << 59;
+
+// Ask compiler to generate Vulkan transform feedback support code when using the
+// VK_EXT_transform_feedback extension.
+const ShCompileOptions SH_ADD_VULKAN_XFB_EXTENSION_SUPPORT_CODE = UINT64_C(1) << 60;
+
+// This flag initializes fragment shader's output variables to zero at the beginning of the fragment
+// shader's main(). It is intended as a workaround for drivers which get context lost if
+// gl_FragColor is not written.
+const ShCompileOptions SH_INIT_FRAGMENT_OUTPUT_VARIABLES = UINT64_C(1) << 61;
 
 // Defines alternate strategies for implementing array index clamping.
 enum ShArrayIndexClampingStrategy
@@ -382,14 +400,18 @@ struct ShBuiltInResources
     int EXT_shader_texture_lod;
     int WEBGL_debug_shader_precision;
     int EXT_shader_framebuffer_fetch;
+    int EXT_shader_framebuffer_fetch_non_coherent;
     int NV_shader_framebuffer_fetch;
     int NV_shader_noperspective_interpolation;
     int ARM_shader_framebuffer_fetch;
     int OVR_multiview;
     int OVR_multiview2;
     int EXT_multisampled_render_to_texture;
+    int EXT_multisampled_render_to_texture2;
     int EXT_YUV_target;
     int EXT_geometry_shader;
+    int OES_shader_io_blocks;
+    int EXT_shader_io_blocks;
     int EXT_gpu_shader5;
     int EXT_shader_non_constant_global_initializers;
     int OES_texture_storage_multisample_2d_array;
@@ -398,6 +420,17 @@ struct ShBuiltInResources
     int ANGLE_multi_draw;
     int ANGLE_base_vertex_base_instance;
     int WEBGL_video_texture;
+    int APPLE_clip_distance;
+    int OES_texture_cube_map_array;
+    int EXT_texture_cube_map_array;
+    int EXT_shadow_samplers;
+    int OES_shader_multisample_interpolation;
+    int OES_shader_image_atomic;
+    int EXT_tessellation_shader;
+    int OES_texture_buffer;
+    int EXT_texture_buffer;
+    int OES_sample_variables;
+    int EXT_clip_cull_distance;
 
     // Set to 1 to enable replacing GL_EXT_draw_buffers #extension directives
     // with GL_NV_draw_buffers in ESSL output. This flag can be used to emulate
@@ -454,6 +487,10 @@ struct ShBuiltInResources
 
     // maximum number of available image units
     int MaxImageUnits;
+
+    // OES_sample_variables constant
+    // maximum number of available samples
+    int MaxSamples;
 
     // maximum number of image uniforms in a vertex shader
     int MaxVertexImageUniforms;
@@ -537,8 +574,35 @@ struct ShBuiltInResources
     int MaxGeometryShaderInvocations;
     int MaxGeometryImageUniforms;
 
+    // EXT_tessellation_shader constants
+    int MaxTessControlInputComponents;
+    int MaxTessControlOutputComponents;
+    int MaxTessControlTextureImageUnits;
+    int MaxTessControlUniformComponents;
+    int MaxTessControlTotalOutputComponents;
+    int MaxTessControlImageUniforms;
+    int MaxTessControlAtomicCounters;
+    int MaxTessControlAtomicCounterBuffers;
+
+    int MaxTessPatchComponents;
+    int MaxPatchVertices;
+    int MaxTessGenLevel;
+
+    int MaxTessEvaluationInputComponents;
+    int MaxTessEvaluationOutputComponents;
+    int MaxTessEvaluationTextureImageUnits;
+    int MaxTessEvaluationUniformComponents;
+    int MaxTessEvaluationImageUniforms;
+    int MaxTessEvaluationAtomicCounters;
+    int MaxTessEvaluationAtomicCounterBuffers;
+
     // Subpixel bits used in rasterization.
     int SubPixelBits;
+
+    // APPLE_clip_distance/EXT_clip_cull_distance constant
+    int MaxClipDistances;
+    int MaxCullDistances;
+    int MaxCombinedClipAndCullDistances;
 };
 
 //
@@ -671,6 +735,9 @@ int GetVertexShaderNumViews(const ShHandle handle);
 // Returns true if compiler has injected instructions for early fragment tests as an optimization
 bool HasEarlyFragmentTestsOptimization(const ShHandle handle);
 
+// Returns specialization constant usage bits
+uint32_t GetShaderSpecConstUsageBits(const ShHandle handle);
+
 // Returns true if the passed in variables pack in maxVectors followingthe packing rules from the
 // GLSL 1.017 spec, Appendix A, section 7.
 // Returns false otherwise. Also look at the SH_ENFORCE_PACKING_RESTRICTIONS
@@ -705,6 +772,7 @@ bool GetUniformBlockRegister(const ShHandle handle,
 
 bool ShouldUniformBlockUseStructuredBuffer(const ShHandle handle,
                                            const std::string &uniformBlockName);
+const std::set<std::string> *GetSlowCompilingUniformBlockSet(const ShHandle handle);
 
 // Gives a map from uniform names to compiler-assigned registers in the default uniform block.
 // Note that the map contains also registers of samplers that have been extracted from structs.
@@ -726,11 +794,20 @@ const std::set<std::string> *GetUsedImage2DFunctionNames(const ShHandle handle);
 bool HasValidGeometryShaderInputPrimitiveType(const ShHandle handle);
 bool HasValidGeometryShaderOutputPrimitiveType(const ShHandle handle);
 bool HasValidGeometryShaderMaxVertices(const ShHandle handle);
+bool HasValidTessGenMode(const ShHandle handle);
+bool HasValidTessGenSpacing(const ShHandle handle);
+bool HasValidTessGenVertexOrder(const ShHandle handle);
+bool HasValidTessGenPointMode(const ShHandle handle);
 GLenum GetGeometryShaderInputPrimitiveType(const ShHandle handle);
 GLenum GetGeometryShaderOutputPrimitiveType(const ShHandle handle);
 int GetGeometryShaderInvocations(const ShHandle handle);
 int GetGeometryShaderMaxVertices(const ShHandle handle);
 unsigned int GetShaderSharedMemorySize(const ShHandle handle);
+int GetTessControlShaderVertices(const ShHandle handle);
+GLenum GetTessGenMode(const ShHandle handle);
+GLenum GetTessGenSpacing(const ShHandle handle);
+GLenum GetTessGenVertexOrder(const ShHandle handle);
+GLenum GetTessGenPointMode(const ShHandle handle);
 
 //
 // Helper function to identify specs that are based on the WebGL spec.
@@ -760,9 +837,38 @@ namespace vk
 enum class SpecializationConstantId : uint32_t
 {
     LineRasterEmulation = 0,
+    SurfaceRotation     = 1,
+    DrawableWidth       = 2,
+    DrawableHeight      = 3,
 
-    InvalidEnum = 1,
-    EnumCount   = 1,
+    InvalidEnum = 4,
+    EnumCount   = InvalidEnum,
+};
+
+enum class SurfaceRotation : uint32_t
+{
+    Identity,
+    Rotated90Degrees,
+    Rotated180Degrees,
+    Rotated270Degrees,
+    FlippedIdentity,
+    FlippedRotated90Degrees,
+    FlippedRotated180Degrees,
+    FlippedRotated270Degrees,
+
+    InvalidEnum,
+    EnumCount = InvalidEnum,
+};
+
+enum class SpecConstUsage : uint32_t
+{
+    LineRasterEmulation = 0,
+    YFlip               = 1,
+    Rotation            = 2,
+    DrawableSize        = 3,
+
+    InvalidEnum = 4,
+    EnumCount   = InvalidEnum,
 };
 
 // Interface block name containing the aggregate default uniforms
@@ -783,7 +889,29 @@ extern const char kAtomicCountersBlockName[];
 // Line raster emulation varying
 extern const char kLineRasterEmulationPosition[];
 
+// Transform feedback emulation support
+extern const char kXfbEmulationGetOffsetsFunctionName[];
+extern const char kXfbEmulationCaptureFunctionName[];
+extern const char kXfbEmulationBufferBlockName[];
+extern const char kXfbEmulationBufferName[];
+extern const char kXfbEmulationBufferFieldName[];
+
+// Transform feedback extension support
+extern const char kXfbExtensionPositionOutName[];
+
+// EXT_shader_framebuffer_fetch and EXT_shader_framebuffer_fetch_non_coherent
+extern const char kInputAttachmentName[];
+
 }  // namespace vk
+
+namespace mtl
+{
+// Specialization constant to enable GL_SAMPLE_COVERAGE_VALUE emulation.
+extern const char kCoverageMaskEnabledConstName[];
+
+// Specialization constant to emulate rasterizer discard.
+extern const char kRasterizerDiscardEnabledConstName[];
+}  // namespace mtl
 }  // namespace sh
 
 #endif  // GLSLANG_SHADERLANG_H_
