@@ -1347,9 +1347,11 @@ enum class ImageLayout
     ColorAttachment,
     ColorAttachmentAndFragmentShaderRead,
     ColorAttachmentAndAllShadersRead,
-    DepthStencilAttachmentAndFragmentShaderRead,
-    DepthStencilAttachmentAndAllShadersRead,
-    DepthStencilReadOnly,
+    DSAttachmentWriteAndFragmentShaderRead,
+    DSAttachmentWriteAndAllShadersRead,
+    DSAttachmentReadAndFragmentShaderRead,
+    DSAttachmentReadAndAllShadersRead,
+    DepthStencilAttachmentReadOnly,
     DepthStencilAttachment,
     DepthStencilResolveAttachment,
     Present,
@@ -1562,6 +1564,7 @@ class ImageHelper final : public Resource, public angle::Subject
 
     void setTilingMode(VkImageTiling tilingMode) { mTilingMode = tilingMode; }
     VkImageTiling getTilingMode() const { return mTilingMode; }
+    VkImageCreateFlags getCreateFlags() const { return mCreateFlags; }
     VkImageUsageFlags getUsage() const { return mUsage; }
     VkImageType getType() const { return mImageType; }
     const VkExtent3D &getExtents() const { return mExtents; }
@@ -2054,6 +2057,7 @@ class ImageHelper final : public Resource, public angle::Subject
     // Image properties.
     VkImageType mImageType;
     VkImageTiling mTilingMode;
+    VkImageCreateFlags mCreateFlags;
     VkImageUsageFlags mUsage;
     // For Android swapchain images, the Vulkan VkImage must be "rotated".  However, most of ANGLE
     // uses non-rotated extents (i.e. the way the application views the extents--see "Introduction

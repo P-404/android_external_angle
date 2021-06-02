@@ -2449,6 +2449,7 @@ void Context::drawArraysInstanced(PrimitiveMode mode,
     // No-op if count draws no primitives for given mode
     if (noopDrawInstanced(mode, count, instanceCount))
     {
+        ANGLE_CONTEXT_TRY(mImplementation->handleNoopDrawEvent());
         return;
     }
 
@@ -2468,6 +2469,7 @@ void Context::drawElementsInstanced(PrimitiveMode mode,
     // No-op if count draws no primitives for given mode
     if (noopDrawInstanced(mode, count, instances))
     {
+        ANGLE_CONTEXT_TRY(mImplementation->handleNoopDrawEvent());
         return;
     }
 
@@ -2486,6 +2488,7 @@ void Context::drawElementsBaseVertex(PrimitiveMode mode,
     // No-op if count draws no primitives for given mode
     if (noopDraw(mode, count))
     {
+        ANGLE_CONTEXT_TRY(mImplementation->handleNoopDrawEvent());
         return;
     }
 
@@ -2505,6 +2508,7 @@ void Context::drawElementsInstancedBaseVertex(PrimitiveMode mode,
     // No-op if count draws no primitives for given mode
     if (noopDrawInstanced(mode, count, instancecount))
     {
+        ANGLE_CONTEXT_TRY(mImplementation->handleNoopDrawEvent());
         return;
     }
 
@@ -2524,6 +2528,7 @@ void Context::drawRangeElements(PrimitiveMode mode,
     // No-op if count draws no primitives for given mode
     if (noopDraw(mode, count))
     {
+        ANGLE_CONTEXT_TRY(mImplementation->handleNoopDrawEvent());
         return;
     }
 
@@ -2544,6 +2549,7 @@ void Context::drawRangeElementsBaseVertex(PrimitiveMode mode,
     // No-op if count draws no primitives for given mode
     if (noopDraw(mode, count))
     {
+        ANGLE_CONTEXT_TRY(mImplementation->handleNoopDrawEvent());
         return;
     }
 
@@ -3552,6 +3558,7 @@ void Context::initCaps()
 {
     mState.mCaps = mImplementation->getNativeCaps();
 
+    // TODO (http://anglebug.com/6010): mSupportedExtensions should not be modified here
     mSupportedExtensions = generateSupportedExtensions();
 
     if (!mDisplay->getFrontendFeatures().allowCompressedFormats.enabled)
@@ -3784,6 +3791,17 @@ void Context::initCaps()
         constexpr GLint maxDrawBuffers = 4;
         INFO() << "Limiting draw buffer count to " << maxDrawBuffers;
         ANGLE_LIMIT_CAP(mState.mCaps.maxDrawBuffers, maxDrawBuffers);
+
+        // Unity based applications are sending down GL streams with undefined behavior.
+        // Disabling EGL_KHR_create_context_no_error (which enables a new EGL attrib) prevents that,
+        // but we don't have the infrastructure for disabling EGL extensions yet.
+        // Instead, disable GL_KHR_no_error (which disables exposing the GL extension), which
+        // prevents writing invalid calls to the capture.
+        INFO() << "Enabling validation to prevent invalid calls from being captured. This "
+                  "effectively disables GL_KHR_no_error and enables GL_ANGLE_robust_client_memory.";
+        mSkipValidation                       = false;
+        mState.mExtensions.noError            = mSkipValidation;
+        mState.mExtensions.robustClientMemory = !mSkipValidation;
     }
 
     // Disable support for OES_get_program_binary
@@ -5851,6 +5869,11 @@ void Context::pushDebugGroup(GLenum source, GLuint id, GLsizei length, const GLc
     mState.getDebug().pushGroup(source, id, std::move(msg));
 }
 
+angle::Result Context::handleNoopDrawEvent()
+{
+    return (mImplementation->handleNoopDrawEvent());
+}
+
 void Context::popDebugGroup()
 {
     mState.getDebug().popGroup();
@@ -6356,6 +6379,7 @@ void Context::drawArraysInstancedBaseInstance(PrimitiveMode mode,
 {
     if (noopDraw(mode, count))
     {
+        ANGLE_CONTEXT_TRY(mImplementation->handleNoopDrawEvent());
         return;
     }
 
@@ -6388,6 +6412,7 @@ void Context::drawElementsInstancedBaseVertexBaseInstance(PrimitiveMode mode,
 {
     if (noopDraw(mode, count))
     {
+        ANGLE_CONTEXT_TRY(mImplementation->handleNoopDrawEvent());
         return;
     }
 
