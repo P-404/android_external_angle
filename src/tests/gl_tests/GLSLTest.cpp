@@ -515,7 +515,7 @@ class GLSLTest_ES3 : public GLSLTest
 class GLSLTest_ES31 : public GLSLTest
 {};
 
-std::string BuillBigInitialStackShader(int length)
+std::string BuildBigInitialStackShader(int length)
 {
     std::string result;
     result += "void main() { \n";
@@ -1351,6 +1351,38 @@ TEST_P(GLSLTest, InvariantAllBoth)
     EXPECT_EQ(0u, program);
 }
 
+// Verify that using a struct as both invariant and non-invariant output works.
+TEST_P(GLSLTest_ES31, StructBothInvariantAndNot)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_shader_io_blocks"));
+
+    constexpr char kVS[] = R"(#version 310 es
+#extension GL_EXT_shader_io_blocks : require
+
+struct S
+{
+    vec4 s;
+};
+
+out Output
+{
+    vec4 x;
+    invariant S s;
+};
+
+out S s2;
+
+void main(){
+    x = vec4(0);
+    s.s = vec4(1);
+    s2.s = vec4(2);
+})";
+
+    GLuint shader = CompileShader(GL_VERTEX_SHADER, kVS);
+    EXPECT_NE(0u, shader);
+    glDeleteShader(shader);
+}
+
 // Verify that functions without return statements still compile
 TEST_P(GLSLTest, MissingReturnFloat)
 {
@@ -1477,6 +1509,25 @@ TEST_P(GLSLTest_ES3, MissingReturnStructOfArrays)
         "s f() { if (v_varying > 0.0) { return s(float[2](1.0, 1.0), int[2](1, 1),"
         "vec2[2](vec2(1.0, 1.0), vec2(1.0, 1.0))); } }\n"
         "void main() { gl_Position = vec4(f().a[0], 0, 0, 1); }\n";
+
+    GLuint program = CompileProgram(kVS, essl3_shaders::fs::Red());
+    EXPECT_NE(0u, program);
+}
+
+// Verify that non-const index used on an array returned by a function compiles
+TEST_P(GLSLTest_ES3, ReturnArrayOfStructsThenNonConstIndex)
+{
+    constexpr char kVS[] = R"(#version 300 es
+in float v_varying;
+struct s { float a; int b; vec2 c; };
+s[2] f()
+{
+    return s[2](s(v_varying, 1, vec2(1.0, 1.0)), s(v_varying / 2.0, 1, vec2(1.0, 1.0)));
+}
+void main()
+{
+    gl_Position = vec4(f()[uint(v_varying)].a, 0, 0, 1);
+})";
 
     GLuint program = CompileProgram(kVS, essl3_shaders::fs::Red());
     EXPECT_NE(0u, program);
@@ -4364,8 +4415,9 @@ TEST_P(GLSLTest_ES31, ArraysOfArraysStructDifferentTypesSampler)
                 glActiveTexture(GL_TEXTURE0 + textureUnit);
                 glBindTexture(GL_TEXTURE_2D, textures[i][j][k]);
                 GLint texData[4]        = {i + 1, j + 1, k + 1, 1};
-                GLubyte texDataFloat[4] = {(i + 1) * 64 - 1, (j + 1) * 64 - 1, (k + 1) * 64 - 1,
-                                           64};
+                GLubyte texDataFloat[4] = {static_cast<GLubyte>((i + 1) * 64 - 1),
+                                           static_cast<GLubyte>((j + 1) * 64 - 1),
+                                           static_cast<GLubyte>((k + 1) * 64 - 1), 64};
                 if (j == 0)
                 {
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32I, 1, 1, 0, GL_RGBA_INTEGER, GL_INT,
@@ -8105,6 +8157,71 @@ foo
     ANGLE_GL_PROGRAM(program, kVS, kFS);
 }
 
+// Test that clamp applied on non-literal indices is correct on es 100 shaders.
+TEST_P(GLSLTest, ValidIndexClampES100)
+{
+    // http://anglebug.com/6027
+    ANGLE_SKIP_TEST_IF(IsD3D9());
+
+    constexpr char kFS[] = R"(
+precision mediump float;
+uniform int u;
+uniform mat4 m[2];
+void main()
+{
+    gl_FragColor = vec4(m[u][1].xyz, 1);
+}
+)";
+
+    ANGLE_GL_PROGRAM(program, essl1_shaders::vs::Simple(), kFS);
+    glUseProgram(program);
+
+    GLint uniformLocation = glGetUniformLocation(program, "u");
+    ASSERT_NE(-1, uniformLocation);
+
+    GLint matrixLocation = glGetUniformLocation(program, "m");
+    ASSERT_NE(matrixLocation, -1);
+    const std::array<GLfloat, 32> mValue = {{0.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.5f, 0.0f, 0.0f,
+                                             0.0f, 0.0f, 0.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.5f,
+                                             1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                                             0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f}};
+    glUniformMatrix4fv(matrixLocation, 2, false, mValue.data());
+
+    glUniform1i(uniformLocation, 1);
+    drawQuad(program, essl3_shaders::PositionAttrib(), 0.5f);
+    EXPECT_GL_NO_ERROR();
+
+    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::green);
+}
+
+// Test that clamp applied on non-literal indices is correct on es 300 shaders.
+TEST_P(GLSLTest_ES3, ValidIndexClampES300)
+{
+    constexpr char kFS[] = R"(#version 300 es
+precision mediump float;
+out vec4 color;
+uniform int u;
+mat4 m[4] = mat4[4](mat4(0.25), mat4(0.5), mat4(1), mat4(0.75));
+void main()
+{
+    color = vec4(m[u][2].xyz, 1);
+}
+)";
+
+    ANGLE_GL_PROGRAM(program, essl3_shaders::vs::Simple(), kFS);
+    glUseProgram(program);
+
+    GLint uniformLocation = glGetUniformLocation(program, "u");
+    ASSERT_NE(-1, uniformLocation);
+
+    glUniform1i(uniformLocation, 2);
+    EXPECT_GL_NO_ERROR();
+    drawQuad(program, essl3_shaders::PositionAttrib(), 0.5f);
+    EXPECT_GL_NO_ERROR();
+
+    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::blue);
+}
+
 // Tests constant folding of non-square 'matrixCompMult'.
 TEST_P(GLSLTest_ES3, NonSquareMatrixCompMult)
 {
@@ -8178,7 +8295,7 @@ TEST_P(GLSLTest, MemoryExhaustedTest)
 {
     ANGLE_SKIP_TEST_IF(IsD3D11_FL93());
     GLuint program =
-        CompileProgram(essl1_shaders::vs::Simple(), BuillBigInitialStackShader(36).c_str());
+        CompileProgram(essl1_shaders::vs::Simple(), BuildBigInitialStackShader(36).c_str());
     EXPECT_NE(0u, program);
 }
 
@@ -10110,9 +10227,6 @@ TEST_P(GLSLTest_ES31, IOBlockLocations)
     ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_shader_io_blocks"));
     ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_geometry_shader"));
 
-    // http://anglebug.com/5444
-    ANGLE_SKIP_TEST_IF(IsIntel() && IsOpenGL() && IsWindows());
-
     constexpr char kVS[] = R"(#version 310 es
 #extension GL_EXT_shader_io_blocks : require
 
@@ -10746,6 +10860,48 @@ void main() {
     GLint compileResult;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &compileResult);
     EXPECT_NE(compileResult, 0);
+}
+
+// Test that providing more components to a matrix constructor than necessary works.  Based on a
+// clusterfuzz test that caught an OOB array write in glslang.
+TEST_P(GLSLTest, MatrixConstructor)
+{
+    constexpr char kVS[] = R"(attribute vec4 aPosition;
+varying vec4 vColor;
+void main()
+{
+    gl_Position = aPosition;
+    vec4 color = vec4(aPosition.xy, 0, 1);
+    mat4 m4 = mat4(color, color.yzwx, color.zwx, color.zwxy, color.wxyz);
+    vColor = m4[0];
+})";
+
+    GLuint shader = CompileShader(GL_VERTEX_SHADER, kVS);
+    EXPECT_NE(0u, shader);
+    glDeleteShader(shader);
+}
+
+// Test that initializing global variables with non-constant values work
+TEST_P(GLSLTest_ES3, InitGlobalNonConstant)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_shader_non_constant_global_initializers"));
+
+    constexpr char kVS[] = R"(#version 300 es
+#extension GL_EXT_shader_non_constant_global_initializers : require
+uniform vec4 u;
+out vec4 color;
+
+vec4 global1 = u;
+vec4 global2 = u + vec4(1);
+vec4 global3 = global1 * global2;
+void main()
+{
+    color = global3;
+})";
+
+    GLuint shader = CompileShader(GL_VERTEX_SHADER, kVS);
+    EXPECT_NE(0u, shader);
+    glDeleteShader(shader);
 }
 
 }  // anonymous namespace

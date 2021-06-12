@@ -18,7 +18,11 @@ namespace cl
 class Memory : public _cl_mem, public Object
 {
   public:
-    using PtrList   = std::list<MemoryPtr>;
+    // Front end entry functions, only called from OpenCL entry points
+
+    cl_int getInfo(MemInfo name, size_t valueSize, void *value, size_t *valueSizeRet) const;
+
+  public:
     using PropArray = std::vector<cl_mem_properties>;
 
     ~Memory() override;
@@ -27,49 +31,48 @@ class Memory : public _cl_mem, public Object
 
     const Context &getContext() const;
     const PropArray &getProperties() const;
-    cl_mem_flags getFlags() const;
+    MemFlags getFlags() const;
     void *getHostPtr() const;
-    const MemoryRefPtr &getParent() const;
+    const MemoryPtr &getParent() const;
     size_t getOffset() const;
+    size_t getSize() const;
 
-    void retain() noexcept;
-    bool release();
+    template <typename T = rx::CLMemoryImpl>
+    T &getImpl() const;
 
-    cl_int getInfo(MemInfo name, size_t valueSize, void *value, size_t *valueSizeRet) const;
-
-    static bool IsValid(const _cl_mem *memory);
+    MemFlags getEffectiveFlags() const;
 
   protected:
     Memory(const Buffer &buffer,
            Context &context,
            PropArray &&properties,
-           cl_mem_flags flags,
+           MemFlags flags,
            size_t size,
            void *hostPtr,
-           cl_int *errcodeRet);
+           cl_int &errorCode);
 
     Memory(const Buffer &buffer,
            Buffer &parent,
-           cl_mem_flags flags,
+           MemFlags flags,
            size_t offset,
            size_t size,
-           cl_int *errcodeRet);
+           cl_int &errorCode);
 
     Memory(const Image &image,
            Context &context,
            PropArray &&properties,
-           cl_mem_flags flags,
+           MemFlags flags,
            const cl_image_format &format,
            const ImageDescriptor &desc,
            Memory *parent,
            void *hostPtr,
-           cl_int *errcodeRet);
+           cl_int &errorCode);
 
-    const ContextRefPtr mContext;
+    const ContextPtr mContext;
     const PropArray mProperties;
-    const cl_mem_flags mFlags;
+    const MemFlags mFlags;
     void *const mHostPtr = nullptr;
-    const MemoryRefPtr mParent;
+    const MemoryPtr mParent;
     const size_t mOffset = 0u;
     const rx::CLMemoryImpl::Ptr mImpl;
     const size_t mSize;
@@ -90,7 +93,7 @@ inline const Memory::PropArray &Memory::getProperties() const
     return mProperties;
 }
 
-inline cl_mem_flags Memory::getFlags() const
+inline MemFlags Memory::getFlags() const
 {
     return mFlags;
 }
@@ -100,7 +103,7 @@ inline void *Memory::getHostPtr() const
     return mHostPtr;
 }
 
-inline const MemoryRefPtr &Memory::getParent() const
+inline const MemoryPtr &Memory::getParent() const
 {
     return mParent;
 }
@@ -110,9 +113,15 @@ inline size_t Memory::getOffset() const
     return mOffset;
 }
 
-inline void Memory::retain() noexcept
+inline size_t Memory::getSize() const
 {
-    addRef();
+    return mSize;
+}
+
+template <typename T>
+inline T &Memory::getImpl() const
+{
+    return static_cast<T &>(*mImpl);
 }
 
 }  // namespace cl

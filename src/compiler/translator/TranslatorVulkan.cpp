@@ -21,19 +21,19 @@
 #include "compiler/translator/OutputVulkanGLSL.h"
 #include "compiler/translator/StaticType.h"
 #include "compiler/translator/glslang_wrapper.h"
+#include "compiler/translator/tree_ops/RemoveAtomicCounterBuiltins.h"
+#include "compiler/translator/tree_ops/RemoveInactiveInterfaceVariables.h"
+#include "compiler/translator/tree_ops/RewriteAtomicCounters.h"
+#include "compiler/translator/tree_ops/RewriteCubeMapSamplersAs2DArray.h"
+#include "compiler/translator/tree_ops/RewriteDfdy.h"
+#include "compiler/translator/tree_ops/RewriteStructSamplers.h"
 #include "compiler/translator/tree_ops/vulkan/DeclarePerVertexBlocks.h"
 #include "compiler/translator/tree_ops/vulkan/FlagSamplersWithTexelFetch.h"
 #include "compiler/translator/tree_ops/vulkan/MonomorphizeUnsupportedFunctionsInVulkanGLSL.h"
-#include "compiler/translator/tree_ops/vulkan/RemoveAtomicCounterBuiltins.h"
-#include "compiler/translator/tree_ops/vulkan/RemoveInactiveInterfaceVariables.h"
 #include "compiler/translator/tree_ops/vulkan/ReplaceForShaderFramebufferFetch.h"
 #include "compiler/translator/tree_ops/vulkan/RewriteArrayOfArrayOfOpaqueUniforms.h"
-#include "compiler/translator/tree_ops/vulkan/RewriteAtomicCounters.h"
-#include "compiler/translator/tree_ops/vulkan/RewriteCubeMapSamplersAs2DArray.h"
-#include "compiler/translator/tree_ops/vulkan/RewriteDfdy.h"
 #include "compiler/translator/tree_ops/vulkan/RewriteInterpolateAtOffset.h"
 #include "compiler/translator/tree_ops/vulkan/RewriteR32fImages.h"
-#include "compiler/translator/tree_ops/vulkan/RewriteStructSamplers.h"
 #include "compiler/translator/tree_ops/vulkan/SeparateStructFromUniformDeclarations.h"
 #include "compiler/translator/tree_util/BuiltIn.h"
 #include "compiler/translator/tree_util/DriverUniform.h"
@@ -390,9 +390,11 @@ ANGLE_NO_DISCARD bool AddXfbEmulationSupport(TCompiler *compiler,
     constexpr uint32_t kMaxXfbBuffers = 4;
 
     const TType *ivec4Type = StaticType::GetBasic<EbtInt, kMaxXfbBuffers>();
+    TType *stridesType     = new TType(*ivec4Type);
+    stridesType->setQualifier(EvqConst);
 
     // Create the parameter variable.
-    TVariable *stridesVar        = new TVariable(symbolTable, ImmutableString("strides"), ivec4Type,
+    TVariable *stridesVar = new TVariable(symbolTable, ImmutableString("strides"), stridesType,
                                           SymbolType::AngleInternal);
     TIntermSymbol *stridesSymbol = new TIntermSymbol(stridesVar);
 
@@ -479,10 +481,8 @@ ANGLE_NO_DISCARD bool AddXfbEmulationSupport(TCompiler *compiler,
 
     // Create a call to ANGLEGetXfbOffsets too, for the sole purpose of preventing it from being
     // culled as unused by glslang.
-    TIntermSequence zero;
-    zero.push_back(CreateIndexNode(0));
     TIntermSequence ivec4Zero;
-    ivec4Zero.push_back(TIntermAggregate::CreateConstructor(*ivec4Type, &zero));
+    ivec4Zero.push_back(CreateZeroNode(*ivec4Type));
     TIntermAggregate *getOffsetsCall =
         TIntermAggregate::CreateFunctionCall(*getOffsetsFunction, &ivec4Zero);
     captureXfbBlock->appendStatement(getOffsetsCall);
@@ -1340,7 +1340,11 @@ bool TranslatorVulkan::translate(TIntermBlock *root,
     }
 
 #if defined(ANGLE_ENABLE_DIRECT_SPIRV_GENERATION)
-    if ((compileOptions & SH_GENERATE_SPIRV_DIRECTLY) != 0 && getShaderType() == GL_VERTEX_SHADER)
+    constexpr ShCompileOptions kUnsupportedTransformations = SH_ADD_BRESENHAM_LINE_RASTER_EMULATION;
+    if ((compileOptions & SH_GENERATE_SPIRV_DIRECTLY) != 0 &&
+        ((getShaderType() == GL_VERTEX_SHADER &&
+          (compileOptions & kUnsupportedTransformations) == 0) ||
+         getShaderType() == GL_COMPUTE_SHADER))
     {
         // Declare the implicitly defined gl_PerVertex I/O blocks if not already.  This will help
         // SPIR-V generation treat them mostly like usual I/O blocks.
@@ -1354,10 +1358,9 @@ bool TranslatorVulkan::translate(TIntermBlock *root,
 #endif
 
     // Write translated shader.
-    TOutputVulkanGLSL outputGLSL(sink, getArrayIndexClampingStrategy(), getHashFunction(),
-                                 getNameMap(), &getSymbolTable(), getShaderType(),
-                                 getShaderVersion(), getOutputType(), precisionEmulation,
-                                 enablePrecision, compileOptions);
+    TOutputVulkanGLSL outputGLSL(sink, getHashFunction(), getNameMap(), &getSymbolTable(),
+                                 getShaderType(), getShaderVersion(), getOutputType(),
+                                 precisionEmulation, enablePrecision, compileOptions);
     root->traverse(&outputGLSL);
 
     return compileToSpirv(sink);

@@ -9,8 +9,10 @@
 
 #include <set>
 
+#include "compiler/translator/ExtensionBehavior.h"
 #include "compiler/translator/HashNames.h"
 #include "compiler/translator/InfoSink.h"
+#include "compiler/translator/Pragma.h"
 #include "compiler/translator/tree_util/IntermTraverse.h"
 
 namespace sh
@@ -20,7 +22,6 @@ class TOutputGLSLBase : public TIntermTraverser
 {
   public:
     TOutputGLSLBase(TInfoSinkBase &objSink,
-                    ShArrayIndexClampingStrategy clampingStrategy,
                     ShHashFunction64 hashFunction,
                     NameMap &nameMap,
                     TSymbolTable *symbolTable,
@@ -103,8 +104,6 @@ class TOutputGLSLBase : public TIntermTraverser
     TInfoSinkBase &mObjSink;
     bool mDeclaringVariable;
 
-    ShArrayIndexClampingStrategy mClampingStrategy;
-
     // name hashing.
     ShHashFunction64 mHashFunction;
 
@@ -118,6 +117,8 @@ class TOutputGLSLBase : public TIntermTraverser
 
     ShCompileOptions mCompileOptions;
 };
+
+void WritePragma(TInfoSinkBase &out, ShCompileOptions compileOptions, const TPragma &pragma);
 
 void WriteGeometryShaderLayoutQualifiers(TInfoSinkBase &out,
                                          sh::TLayoutPrimitiveType inputPrimitive,
@@ -134,6 +135,14 @@ void WriteTessEvaluationShaderLayoutQualifiers(TInfoSinkBase &out,
                                                sh::TLayoutTessEvaluationType inputPoint);
 
 bool NeedsToWriteLayoutQualifier(const TType &type);
+
+void EmitEarlyFragmentTestsGLSL(const TCompiler &, TInfoSinkBase &sink);
+void EmitWorkGroupSizeGLSL(const TCompiler &, TInfoSinkBase &sink);
+void EmitMultiviewGLSL(const TCompiler &,
+                       const ShCompileOptions &,
+                       const TExtension,
+                       const TBehavior,
+                       TInfoSinkBase &sink);
 
 }  // namespace sh
 

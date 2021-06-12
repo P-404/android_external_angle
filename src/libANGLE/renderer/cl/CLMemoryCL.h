@@ -8,8 +8,6 @@
 #ifndef LIBANGLE_RENDERER_CL_CLMEMORYCL_H_
 #define LIBANGLE_RENDERER_CL_CLMEMORYCL_H_
 
-#include "libANGLE/renderer/cl/cl_types.h"
-
 #include "libANGLE/renderer/CLMemoryImpl.h"
 
 namespace rx
@@ -21,15 +19,22 @@ class CLMemoryCL : public CLMemoryImpl
     CLMemoryCL(const cl::Memory &memory, cl_mem native);
     ~CLMemoryCL() override;
 
-    size_t getSize() const override;
+    cl_mem getNative();
+
+    size_t getSize(cl_int &errorCode) const override;
 
     CLMemoryImpl::Ptr createSubBuffer(const cl::Buffer &buffer,
                                       size_t size,
-                                      cl_int *errcodeRet) override;
+                                      cl_int &errorCode) override;
 
   private:
     const cl_mem mNative;
 };
+
+inline cl_mem CLMemoryCL::getNative()
+{
+    return mNative;
+}
 
 }  // namespace rx
 

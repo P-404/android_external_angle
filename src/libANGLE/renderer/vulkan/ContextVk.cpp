@@ -1293,9 +1293,9 @@ angle::Result ContextVk::handleDirtyEventLogImpl(vk::CommandBuffer *commandBuffe
     // to call the vkCmd*DebugUtilsLabelEXT functions in order to communicate to debuggers
     // (e.g. AGI) the OpenGL ES commands that the application uses.
 
-    // Exit early if no OpenGL ES commands have been logged or if calling the
-    // vkCmd*DebugUtilsLabelEXT functions is not enabled.
-    if (mEventLog.empty() || !mRenderer->angleDebuggerMode())
+    // Exit early if no OpenGL ES commands have been logged, or if no command buffer (for a no-op
+    // draw), or if calling the vkCmd*DebugUtilsLabelEXT functions is not enabled.
+    if (mEventLog.empty() || commandBuffer == nullptr || !mRenderer->angleDebuggerMode())
     {
         return angle::Result::Continue;
     }
@@ -3020,26 +3020,34 @@ void ContextVk::logEvent(const char *eventString)
     mComputeDirtyBits.set(DIRTY_BIT_EVENT_LOG);
 }
 
-void ContextVk::endEventLog(angle::EntryPoint entryPoint)
+void ContextVk::endEventLog(angle::EntryPoint entryPoint, PipelineType pipelineType)
 {
     if (!mRenderer->angleDebuggerMode())
     {
         return;
     }
 
-    ASSERT(mRenderPassCommands);
-    mRenderPassCommands->getCommandBuffer().endDebugUtilsLabelEXT();
+    if (pipelineType == PipelineType::Graphics)
+    {
+        ASSERT(mRenderPassCommands);
+        mRenderPassCommands->getCommandBuffer().endDebugUtilsLabelEXT();
+    }
+    else
+    {
+        ASSERT(pipelineType == PipelineType::Compute);
+        ASSERT(mOutsideRenderPassCommands);
+        mOutsideRenderPassCommands->getCommandBuffer().endDebugUtilsLabelEXT();
+    }
 }
 
 angle::Result ContextVk::handleNoopDrawEvent()
 {
-    if (!mRenderer->angleDebuggerMode())
-    {
-        return angle::Result::Continue;
-    }
-
-    ASSERT(mRenderPassCommandBuffer);
     // Even though this draw call is being no-op'd, we still must handle the dirty event log
+    return handleDirtyEventLogImpl(mRenderPassCommandBuffer);
+}
+
+angle::Result ContextVk::handleMidRenderPassClearEvent()
+{
     return handleDirtyEventLogImpl(mRenderPassCommandBuffer);
 }
 
@@ -4826,7 +4834,7 @@ angle::Result ContextVk::updateActiveTextures(const gl::Context *context)
     const gl::ActiveTextureMask &activeTextures    = executable->getActiveSamplersMask();
     const gl::ActiveTextureTypeArray &textureTypes = executable->getActiveSamplerTypes();
 
-    bool haveImmutableSampler = false;
+    bool recreatePipelineLayout = false;
     for (size_t textureUnit : activeTextures)
     {
         gl::Texture *texture        = textures[textureUnit];
@@ -4904,16 +4912,13 @@ angle::Result ContextVk::updateActiveTextures(const gl::Context *context)
             textureVk->getImageViewSubresourceSerial(samplerState);
         mActiveTexturesDesc.update(textureUnit, imageViewSerial, samplerHelper.getSamplerSerial());
 
-        if (textureVk->getImage().hasImmutableSampler())
-        {
-            haveImmutableSampler = true;
-        }
+        recreatePipelineLayout =
+            textureVk->getAndResetImmutableSamplerDirtyState() || recreatePipelineLayout;
     }
 
-    if (haveImmutableSampler)
+    // Recreate the pipeline layout, if necessary.
+    if (recreatePipelineLayout)
     {
-        // TODO(http://anglebug.com/5033): This will recreate the descriptor pools each time, which
-        // will likely affect performance negatively.
         ANGLE_TRY(mExecutable->createPipelineLayout(context, &mActiveTextures));
 
         // The default uniforms descriptor set was reset during createPipelineLayout(), so mark them

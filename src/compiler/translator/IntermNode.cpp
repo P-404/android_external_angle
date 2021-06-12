@@ -41,7 +41,7 @@ TPrecision GetHigherPrecision(TPrecision left, TPrecision right)
 TConstantUnion *Vectorize(const TConstantUnion &constant, size_t size)
 {
     TConstantUnion *constUnion = new TConstantUnion[size];
-    for (unsigned int i = 0; i < size; ++i)
+    for (size_t i = 0; i < size; ++i)
         constUnion[i] = constant;
 
     return constUnion;
@@ -418,6 +418,14 @@ TIntermBlock::TIntermBlock(const TIntermBlock &node)
     mIsTreeRoot = false;
 }
 
+TIntermBlock::TIntermBlock(std::initializer_list<TIntermNode *> stmts)
+{
+    for (TIntermNode *stmt : stmts)
+    {
+        appendStatement(stmt);
+    }
+}
+
 size_t TIntermBlock::getChildCount() const
 {
     return mStatements.size();
@@ -453,6 +461,37 @@ TIntermNode *TIntermFunctionPrototype::getChildNode(size_t index) const
 bool TIntermFunctionPrototype::replaceChildNode(TIntermNode *original, TIntermNode *replacement)
 {
     return false;
+}
+
+TIntermDeclaration::TIntermDeclaration(const TVariable *var, TIntermTyped *initExpr)
+{
+    if (initExpr)
+    {
+        appendDeclarator(
+            new TIntermBinary(TOperator::EOpInitialize, new TIntermSymbol(var), initExpr));
+    }
+    else
+    {
+        appendDeclarator(new TIntermSymbol(var));
+    }
+}
+
+TIntermDeclaration::TIntermDeclaration(std::initializer_list<const TVariable *> declarators)
+    : TIntermDeclaration()
+{
+    for (const TVariable *d : declarators)
+    {
+        appendDeclarator(new TIntermSymbol(d));
+    }
+}
+
+TIntermDeclaration::TIntermDeclaration(std::initializer_list<TIntermTyped *> declarators)
+    : TIntermDeclaration()
+{
+    for (TIntermTyped *d : declarators)
+    {
+        appendDeclarator(d);
+    }
 }
 
 size_t TIntermDeclaration::getChildCount() const
@@ -1073,8 +1112,7 @@ TIntermSwizzle::TIntermSwizzle(const TIntermSwizzle &node) : TIntermExpression(n
     mHasFoldedDuplicateOffsets = node.mHasFoldedDuplicateOffsets;
 }
 
-TIntermBinary::TIntermBinary(const TIntermBinary &node)
-    : TIntermOperator(node), mAddIndexClamp(node.mAddIndexClamp)
+TIntermBinary::TIntermBinary(const TIntermBinary &node) : TIntermOperator(node)
 {
     TIntermTyped *leftCopy  = node.mLeft->deepCopy();
     TIntermTyped *rightCopy = node.mRight->deepCopy();
@@ -1335,7 +1373,7 @@ TIntermUnary::TIntermUnary(TOperator op, TIntermTyped *operand, const TFunction 
 }
 
 TIntermBinary::TIntermBinary(TOperator op, TIntermTyped *left, TIntermTyped *right)
-    : TIntermOperator(op), mLeft(left), mRight(right), mAddIndexClamp(false)
+    : TIntermOperator(op), mLeft(left), mRight(right)
 {
     ASSERT(mLeft);
     ASSERT(mRight);

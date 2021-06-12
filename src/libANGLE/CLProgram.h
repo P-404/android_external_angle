@@ -8,7 +8,7 @@
 #ifndef LIBANGLE_CLPROGRAM_H_
 #define LIBANGLE_CLPROGRAM_H_
 
-#include "libANGLE/CLObject.h"
+#include "libANGLE/CLKernel.h"
 #include "libANGLE/renderer/CLProgramImpl.h"
 
 namespace cl
@@ -17,56 +17,68 @@ namespace cl
 class Program final : public _cl_program, public Object
 {
   public:
-    using PtrList = std::list<ProgramPtr>;
-
-    ~Program() override;
-
-    const Context &getContext() const;
-    const DeviceRefList &getDevices() const;
-
-    void retain() noexcept;
-    bool release();
+    // Front end entry functions, only called from OpenCL entry points
 
     cl_int getInfo(ProgramInfo name, size_t valueSize, void *value, size_t *valueSizeRet) const;
 
-    static bool IsValid(const _cl_program *program);
+    cl_kernel createKernel(const char *kernel_name, cl_int &errorCode);
+
+    cl_int createKernels(cl_uint numKernels, cl_kernel *kernels, cl_uint *numKernelsRet);
+
+  public:
+    ~Program() override;
+
+    Context &getContext();
+    const Context &getContext() const;
+    const DevicePtrs &getDevices() const;
+
+    template <typename T = rx::CLProgramImpl>
+    T &getImpl() const;
 
   private:
-    Program(Context &context, std::string &&source, cl_int *errcodeRet);
-    Program(Context &context, const void *il, size_t length, cl_int *errcodeRet);
+    Program(Context &context, std::string &&source, cl_int &errorCode);
+    Program(Context &context, const void *il, size_t length, cl_int &errorCode);
 
     Program(Context &context,
-            DeviceRefList &&devices,
+            DevicePtrs &&devices,
             Binaries &&binaries,
             cl_int *binaryStatus,
-            cl_int *errcodeRet);
+            cl_int &errorCode);
 
-    Program(Context &context, DeviceRefList &&devices, const char *kernelNames, cl_int *errcodeRet);
+    Program(Context &context, DevicePtrs &&devices, const char *kernelNames, cl_int &errorCode);
 
-    const ContextRefPtr mContext;
-    const DeviceRefList mDevices;
+    const ContextPtr mContext;
+    const DevicePtrs mDevices;
     const std::string mIL;
     const rx::CLProgramImpl::Ptr mImpl;
     const std::string mSource;
 
     Binaries mBinaries;
+    size_t mNumKernels;
+    std::string mKernelNames;
 
-    friend class Context;
+    friend class Object;
 };
+
+inline Context &Program::getContext()
+{
+    return *mContext;
+}
 
 inline const Context &Program::getContext() const
 {
     return *mContext;
 }
 
-inline const DeviceRefList &Program::getDevices() const
+inline const DevicePtrs &Program::getDevices() const
 {
     return mDevices;
 }
 
-inline void Program::retain() noexcept
+template <typename T>
+inline T &Program::getImpl() const
 {
-    addRef();
+    return static_cast<T &>(*mImpl);
 }
 
 }  // namespace cl

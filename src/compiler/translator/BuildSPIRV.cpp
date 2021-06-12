@@ -51,7 +51,7 @@ spirv::IdRef SPIRVBuilder::getNewId()
     return newId;
 }
 
-const SpirvTypeData &SPIRVBuilder::getTypeData(const TType &type, TLayoutBlockStorage blockStorage)
+SpirvType SPIRVBuilder::getSpirvType(const TType &type, TLayoutBlockStorage blockStorage) const
 {
     SpirvType spirvType;
     spirvType.type                = type.getBasicType();
@@ -68,30 +68,46 @@ const SpirvTypeData &SPIRVBuilder::getTypeData(const TType &type, TLayoutBlockSt
         spirvType.matrixPacking = EmpColumnMajor;
     }
 
-    const char *blockName = "";
     if (type.getStruct() != nullptr)
     {
         spirvType.block = type.getStruct();
-        blockName       = type.getStruct()->name().data();
     }
     else if (type.isInterfaceBlock())
     {
         spirvType.block = type.getInterfaceBlock();
-        blockName       = type.getInterfaceBlock()->name().data();
 
         // Calculate the block storage from the interface block automatically.  The fields inherit
         // from this.  Default to std140.
-        ASSERT(spirvType.blockStorage == EbsUnspecified);
-        spirvType.blockStorage = type.getLayoutQualifier().blockStorage;
-        if (!IsShaderIoBlock(type.getQualifier()) && spirvType.blockStorage != EbsStd430)
+        if (spirvType.blockStorage == EbsUnspecified)
         {
-            spirvType.blockStorage = EbsStd140;
+            spirvType.blockStorage = type.getLayoutQualifier().blockStorage;
+            if (!IsShaderIoBlock(type.getQualifier()) && spirvType.blockStorage != EbsStd430)
+            {
+                spirvType.blockStorage = EbsStd140;
+            }
         }
     }
     else if (spirvType.arraySizes.empty())
     {
         // No difference in type for non-block non-array types in std140 and std430 block storage.
         spirvType.blockStorage = EbsUnspecified;
+    }
+
+    return spirvType;
+}
+
+const SpirvTypeData &SPIRVBuilder::getTypeData(const TType &type, TLayoutBlockStorage blockStorage)
+{
+    SpirvType spirvType = getSpirvType(type, blockStorage);
+
+    const char *blockName = "";
+    if (type.getStruct() != nullptr)
+    {
+        blockName = type.getStruct()->name().data();
+    }
+    else if (type.isInterfaceBlock())
+    {
+        blockName = type.getInterfaceBlock()->name().data();
     }
 
     return getSpirvTypeData(spirvType, blockName);
@@ -137,7 +153,7 @@ spirv::IdRef SPIRVBuilder::getFunctionTypeId(spirv::IdRef returnTypeId,
     {
         const spirv::IdRef functionTypeId = getNewId();
 
-        spirv::WriteTypeFunction(&mSpirvTypeAndConstantDecls, functionTypeId, returnTypeId,
+        spirv::WriteTypeFunction(&mSpirvFunctionTypeDecls, functionTypeId, returnTypeId,
                                  paramTypeIds);
 
         iter = mFunctionTypeIdMap.insert({key, functionTypeId}).first;
@@ -164,13 +180,22 @@ SpirvTypeData SPIRVBuilder::declareType(const SpirvType &type, const char *block
             subType.blockStorage = EbsUnspecified;
         }
 
-        const spirv::IdRef subTypeId = getSpirvTypeData(subType, "").id;
+        const spirv::IdRef subTypeId = getSpirvTypeData(subType, blockName).id;
 
-        const unsigned int length   = type.arraySizes.back();
-        const spirv::IdRef lengthId = getUintConstant(length);
+        const unsigned int length = type.arraySizes.back();
+        typeId                    = getNewId();
 
-        typeId = getNewId();
-        spirv::WriteTypeArray(&mSpirvTypeAndConstantDecls, typeId, subTypeId, lengthId);
+        if (length == 0)
+        {
+            // Storage buffers may include a dynamically-sized array, which is identified by it
+            // having a length of 0.
+            spirv::WriteTypeRuntimeArray(&mSpirvTypeAndConstantDecls, typeId, subTypeId);
+        }
+        else
+        {
+            const spirv::IdRef lengthId = getUintConstant(length);
+            spirv::WriteTypeArray(&mSpirvTypeAndConstantDecls, typeId, subTypeId, lengthId);
+        }
     }
     else if (type.block != nullptr)
     {
@@ -293,7 +318,7 @@ SpirvTypeData SPIRVBuilder::declareType(const SpirvType &type, const char *block
     // unconditionally and having the SPIR-V transformer remove them, it's better to avoid
     // generating them in the first place.  This both simplifies the transformer and reduces SPIR-V
     // binary size that gets written to disk cache.  http://anglebug.com/4889
-    if (type.block != nullptr)
+    if (type.block != nullptr && type.arraySizes.empty())
     {
         spirv::WriteName(&mSpirvDebug, typeId, blockName);
 
@@ -307,13 +332,14 @@ SpirvTypeData SPIRVBuilder::declareType(const SpirvType &type, const char *block
 
     uint32_t baseAlignment      = 4;
     uint32_t sizeInStorageBlock = 0;
+    uint32_t matrixStride       = 0;
 
     // Calculate base alignment and sizes for types.  Size for blocks are not calculated, as they
     // are done later at the same time Offset decorations are written.
     const bool isOpaqueType = IsOpaqueType(type.type);
     if (!isOpaqueType)
     {
-        baseAlignment = calculateBaseAlignmentAndSize(type, &sizeInStorageBlock);
+        baseAlignment = calculateBaseAlignmentAndSize(type, &sizeInStorageBlock, &matrixStride);
     }
 
     // Write decorations for interface block fields.
@@ -330,14 +356,11 @@ SpirvTypeData SPIRVBuilder::declareType(const SpirvType &type, const char *block
             // Write the Offset decoration for interface blocks and structs in them.
             sizeInStorageBlock = calculateSizeAndWriteOffsetDecorations(type, typeId);
         }
-
-        // TODO: write the MatrixStride decoration.  http://anglebug.com/4889.
     }
 
-    // TODO: handle row-major matrixes.  http://anglebug.com/4889.
     // TODO: handle RelaxedPrecision types.  http://anglebug.com/4889.
 
-    return {typeId, baseAlignment, sizeInStorageBlock};
+    return {typeId, baseAlignment, sizeInStorageBlock, matrixStride};
 }
 
 void SPIRVBuilder::getImageTypeParameters(TBasicType type,
@@ -769,16 +792,131 @@ spirv::IdRef SPIRVBuilder::getCompositeConstant(spirv::IdRef typeId, const spirv
     return iter->second;
 }
 
+void SPIRVBuilder::startNewFunction(spirv::IdRef functionId, const char *name)
+{
+    ASSERT(mSpirvCurrentFunctionBlocks.empty());
+
+    // Add the first block of the function.
+    mSpirvCurrentFunctionBlocks.emplace_back();
+    mSpirvCurrentFunctionBlocks.back().labelId = getNewId();
+
+    // Output debug information.
+    if (name)
+    {
+        spirv::WriteName(&mSpirvDebug, functionId, name);
+    }
+}
+
+void SPIRVBuilder::assembleSpirvFunctionBlocks()
+{
+    // Take all the blocks and place them in the functions section of SPIR-V in sequence.
+    for (const SpirvBlock &block : mSpirvCurrentFunctionBlocks)
+    {
+        // Every block must be properly terminated.
+        ASSERT(block.isTerminated);
+
+        // Generate the OpLabel instruction for the block.
+        spirv::WriteLabel(&mSpirvFunctions, block.labelId);
+
+        // Add the variable declarations if any.
+        mSpirvFunctions.insert(mSpirvFunctions.end(), block.localVariables.begin(),
+                               block.localVariables.end());
+
+        // Add the body of the block.
+        mSpirvFunctions.insert(mSpirvFunctions.end(), block.body.begin(), block.body.end());
+    }
+
+    // Clean up.
+    mSpirvCurrentFunctionBlocks.clear();
+}
+
+spirv::IdRef SPIRVBuilder::declareVariable(spirv::IdRef typeId,
+                                           spv::StorageClass storageClass,
+                                           spirv::IdRef *initializerId,
+                                           const char *name)
+{
+    const bool isFunctionLocal = storageClass == spv::StorageClassFunction;
+
+    // Make sure storage class is consistent with where the variable is declared.
+    ASSERT(!isFunctionLocal || !mSpirvCurrentFunctionBlocks.empty());
+
+    // Function-local variables go in the first block of the function, while the rest are in the
+    // global variables section.
+    spirv::Blob *spirvSection = isFunctionLocal
+                                    ? &mSpirvCurrentFunctionBlocks.front().localVariables
+                                    : &mSpirvVariableDecls;
+
+    spirv::IdRef variableId          = getNewId();
+    const spirv::IdRef typePointerId = getTypePointerId(typeId, storageClass);
+
+    spirv::WriteVariable(spirvSection, typePointerId, variableId, storageClass, initializerId);
+
+    // Output debug information.
+    if (name)
+    {
+        spirv::WriteName(&mSpirvDebug, variableId, name);
+    }
+
+    return variableId;
+}
+
+void SPIRVBuilder::startConditional(size_t blockCount, bool isContinuable, bool isBreakable)
+{
+    mConditionalStack.emplace_back();
+    SpirvConditional &conditional = mConditionalStack.back();
+
+    // Create the requested number of block ids.
+    conditional.blockIds.resize(blockCount);
+    for (spirv::IdRef &blockId : conditional.blockIds)
+    {
+        blockId = getNewId();
+    }
+
+    conditional.isContinuable = isContinuable;
+    conditional.isBreakable   = isBreakable;
+
+    // Don't automatically start the next block.  The caller needs to generate instructions based on
+    // the ids that were just generated above.
+}
+
+void SPIRVBuilder::nextConditionalBlock()
+{
+    ASSERT(!mConditionalStack.empty());
+    SpirvConditional &conditional = mConditionalStack.back();
+
+    ASSERT(conditional.nextBlockToWrite < conditional.blockIds.size());
+    spirv::IdRef blockId = conditional.blockIds[conditional.nextBlockToWrite++];
+
+    // The previous block must have properly terminated.
+    ASSERT(isCurrentFunctionBlockTerminated());
+
+    // Generate a new block.
+    mSpirvCurrentFunctionBlocks.emplace_back();
+    mSpirvCurrentFunctionBlocks.back().labelId = blockId;
+}
+
+void SPIRVBuilder::endConditional()
+{
+    ASSERT(!mConditionalStack.empty());
+
+    // No blocks should be left.
+    ASSERT(mConditionalStack.back().nextBlockToWrite == mConditionalStack.back().blockIds.size());
+
+    mConditionalStack.pop_back();
+}
+
 uint32_t SPIRVBuilder::nextUnusedBinding()
 {
     return mNextUnusedBinding++;
 }
+
 uint32_t SPIRVBuilder::nextUnusedInputLocation(uint32_t consumedCount)
 {
     uint32_t nextUnused = mNextUnusedInputLocation;
     mNextUnusedInputLocation += consumedCount;
     return nextUnused;
 }
+
 uint32_t SPIRVBuilder::nextUnusedOutputLocation(uint32_t consumedCount)
 {
     uint32_t nextUnused = mNextUnusedOutputLocation;
@@ -789,11 +927,6 @@ uint32_t SPIRVBuilder::nextUnusedOutputLocation(uint32_t consumedCount)
 void SPIRVBuilder::addCapability(spv::Capability capability)
 {
     mCapabilities.insert(capability);
-}
-
-void SPIRVBuilder::addExecutionMode(spv::ExecutionMode executionMode)
-{
-    mExecutionModes.insert(executionMode);
 }
 
 void SPIRVBuilder::setEntryPointId(spirv::IdRef id)
@@ -896,7 +1029,8 @@ void SPIRVBuilder::writeInterfaceVariableDecorations(const TType &type, spirv::I
 }
 
 uint32_t SPIRVBuilder::calculateBaseAlignmentAndSize(const SpirvType &type,
-                                                     uint32_t *sizeInStorageBlockOut)
+                                                     uint32_t *sizeInStorageBlockOut,
+                                                     uint32_t *matrixStrideOut)
 {
     // Calculate the base alignment of a type according to the rules of std140 and std430 packing.
     //
@@ -912,6 +1046,10 @@ uint32_t SPIRVBuilder::calculateBaseAlignmentAndSize(const SpirvType &type,
         // > laid out in order, according to rule (9).
         SpirvType baseType  = type;
         baseType.arraySizes = {};
+        if (baseType.arraySizes.empty() && baseType.block == nullptr)
+        {
+            baseType.blockStorage = EbsUnspecified;
+        }
 
         const SpirvTypeData &baseTypeData = getSpirvTypeData(baseType, "");
         uint32_t baseAlignment            = baseTypeData.baseAlignment;
@@ -934,9 +1072,13 @@ uint32_t SPIRVBuilder::calculateBaseAlignmentAndSize(const SpirvType &type,
         uint32_t arraySizeProduct = 1;
         for (uint32_t arraySize : type.arraySizes)
         {
-            arraySizeProduct *= arraySize;
+            // For runtime arrays, arraySize will be 0 and should be excluded.
+            arraySizeProduct *= arraySize > 0 ? arraySize : 1;
         }
         *sizeInStorageBlockOut = baseTypeData.sizeInStorageBlock * arraySizeProduct;
+
+        // Matrix is inherited from the non-array type.
+        *matrixStrideOut = baseTypeData.matrixStride;
 
         return baseAlignment;
     }
@@ -1007,6 +1149,9 @@ uint32_t SPIRVBuilder::calculateBaseAlignmentAndSize(const SpirvType &type,
         *sizeInStorageBlockOut = vectorTypeData.sizeInStorageBlock * type.primarySize *
                                  type.secondarySize / vectorType.primarySize;
 
+        // The matrix stride is simply the alignment of the vector constituting a column or row.
+        *matrixStrideOut = baseAlignment;
+
         return baseAlignment;
     }
 
@@ -1055,17 +1200,36 @@ uint32_t SPIRVBuilder::calculateSizeAndWriteOffsetDecorations(const SpirvType &t
 
     for (const TField *field : type.block->fields())
     {
+        const TType &fieldType = *field->type();
+
         // Round the offset up to the field's alignment.  The spec says:
         //
         // > A structure and each structure member have a base offset and a base alignment, from
         // > which an aligned offset is computed by rounding the base offset up to a multiple of the
         // > base alignment.
-        const SpirvTypeData &fieldTypeData = getTypeData(*field->type(), type.blockStorage);
+        const SpirvTypeData &fieldTypeData = getTypeData(fieldType, type.blockStorage);
         nextOffset                         = rx::roundUp(nextOffset, fieldTypeData.baseAlignment);
 
         // Write the Offset decoration.
-        spirv::WriteMemberDecorate(&mSpirvDecorations, typeId, spirv::LiteralInteger(fieldIndex++),
+        spirv::WriteMemberDecorate(&mSpirvDecorations, typeId, spirv::LiteralInteger(fieldIndex),
                                    spv::DecorationOffset, {spirv::LiteralInteger(nextOffset)});
+
+        // While here, add matrix decorations if any.
+        if (fieldType.isMatrix())
+        {
+            ASSERT(fieldTypeData.matrixStride != 0);
+
+            // MatrixStride
+            spirv::WriteMemberDecorate(
+                &mSpirvDecorations, typeId, spirv::LiteralInteger(fieldIndex),
+                spv::DecorationMatrixStride, {spirv::LiteralInteger(fieldTypeData.matrixStride)});
+
+            // ColMajor or RowMajor
+            const bool isRowMajor = fieldType.getLayoutQualifier().matrixPacking == EmpRowMajor;
+            spirv::WriteMemberDecorate(
+                &mSpirvDecorations, typeId, spirv::LiteralInteger(fieldIndex),
+                isRowMajor ? spv::DecorationRowMajor : spv::DecorationColMajor, {});
+        }
 
         // Calculate the next offset.  The next offset is the current offset plus the size of the
         // field, aligned to its base alignment.
@@ -1077,6 +1241,8 @@ uint32_t SPIRVBuilder::calculateSizeAndWriteOffsetDecorations(const SpirvType &t
         // > the next multiple of the base alignment of the structure.
         nextOffset = nextOffset + fieldTypeData.sizeInStorageBlock;
         nextOffset = rx::roundUp(nextOffset, fieldTypeData.baseAlignment);
+
+        ++fieldIndex;
     }
 
     return nextOffset;
@@ -1121,14 +1287,13 @@ spirv::Blob SPIRVBuilder::getSpirv()
     //
     //   5 for header +
     //   a number of capabilities +
-    //   a number of execution modes +
     //   size of already generated instructions.
     //
     // The actual size is larger due to other metadata instructions such as extensions,
-    // OpExtInstImport, OpEntryPoint etc.
-    result.reserve(5 + mCapabilities.size() * 2 + mExecutionModes.size() * 3 + mSpirvDebug.size() +
-                   mSpirvDecorations.size() + mSpirvTypeAndConstantDecls.size() +
-                   mSpirvTypePointerDecls.size() + mSpirvVariableDecls.size() +
+    // OpExtInstImport, OpEntryPoint, OpExecutionMode etc.
+    result.reserve(5 + mCapabilities.size() * 2 + mSpirvDebug.size() + mSpirvDecorations.size() +
+                   mSpirvTypeAndConstantDecls.size() + mSpirvTypePointerDecls.size() +
+                   mSpirvFunctionTypeDecls.size() + mSpirvVariableDecls.size() +
                    mSpirvFunctions.size());
 
     // Generate any necessary id before writing the id bound in header.
@@ -1167,11 +1332,13 @@ spirv::Blob SPIRVBuilder::getSpirv()
                            mEntryPointInterfaceList);
 
     // - OpExecutionMode instructions
-    for (spv::ExecutionMode executionMode : mExecutionModes)
-    {
-        spirv::WriteExecutionMode(&result, mEntryPointId, executionMode);
-    }
-    result.insert(result.end(), mSpirvExecutionModes.begin(), mSpirvExecutionModes.end());
+    generateExecutionModes(&result);
+
+    // - OpSource instruction.
+    //
+    // This is to support debuggers and capture/replay tools and isn't strictly necessary.
+    spirv::WriteSource(&result, spv::SourceLanguageGLSL, spirv::LiteralInteger(450), nullptr,
+                       nullptr);
 
     // Append the already generated sections in order
     result.insert(result.end(), mSpirvDebug.begin(), mSpirvDebug.end());
@@ -1179,11 +1346,31 @@ spirv::Blob SPIRVBuilder::getSpirv()
     result.insert(result.end(), mSpirvTypeAndConstantDecls.begin(),
                   mSpirvTypeAndConstantDecls.end());
     result.insert(result.end(), mSpirvTypePointerDecls.begin(), mSpirvTypePointerDecls.end());
+    result.insert(result.end(), mSpirvFunctionTypeDecls.begin(), mSpirvFunctionTypeDecls.end());
     result.insert(result.end(), mSpirvVariableDecls.begin(), mSpirvVariableDecls.end());
     result.insert(result.end(), mSpirvFunctions.begin(), mSpirvFunctions.end());
 
     result.shrink_to_fit();
     return result;
+}
+
+void SPIRVBuilder::generateExecutionModes(spirv::Blob *blob)
+{
+    switch (mShaderType)
+    {
+        case gl::ShaderType::Compute:
+        {
+            const sh::WorkGroupSize &localSize = mCompiler->getComputeShaderLocalSize();
+            spirv::WriteExecutionMode(
+                blob, mEntryPointId, spv::ExecutionModeLocalSize,
+                {spirv::LiteralInteger(localSize[0]), spirv::LiteralInteger(localSize[1]),
+                 spirv::LiteralInteger(localSize[2])});
+            break;
+        }
+        default:
+            // TODO: other shader types.  http://anglebug.com/4889
+            break;
+    }
 }
 
 }  // namespace sh

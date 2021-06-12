@@ -149,17 +149,75 @@ struct SpirvTypeData
     // The SPIR-V id corresponding to the type.
     spirv::IdRef id;
     // The base alignment and size of the type based on the storage block it's used in (if
-    // applicable)
+    // applicable).
     uint32_t baseAlignment;
     uint32_t sizeInStorageBlock;
+    // The matrix stride, if matrix or array of matrix.
+    uint32_t matrixStride;
+};
+
+// A block of code.  SPIR-V produces forward references to blocks, such as OpBranchConditional
+// specifying the id of the if and else blocks, each of those referencing the id of the block after
+// the else.  Additionally, local variable declarations are accumulated at the top of the first
+// block in a function.  For these reasons, each block of SPIR-V is generated separately and
+// assembled at the end of the function, allowing prior blocks to be modified when necessary.
+struct SpirvBlock
+{
+    // Id of the block
+    spirv::IdRef labelId;
+
+    // Local variable declarations.  Only the first block of a function is allowed to contain any
+    // instructions here.
+    spirv::Blob localVariables;
+
+    // Everything *after* OpLabel (which itself is not generated until blocks are assembled) and
+    // local variables.
+    spirv::Blob body;
+
+    // Whether the block is terminated.  Useful for functions without return, asserting that code is
+    // not added after return/break/continue etc (i.e. dead code, which should really be removed
+    // earlier by a transformation, but could also be hacked by returning a bogus block to contain
+    // all the "garbage" to throw away), last switch case without a break, etc.
+    bool isTerminated = false;
+};
+
+// Conditional code, constituting ifs, switches and loops.
+struct SpirvConditional
+{
+    // The id of blocks that make up the conditional.
+    //
+    // - For if, there are three blocks: the then, else and merge blocks
+    // - For loops, there are four blocks: the condition, body, continue and merge blocks
+    // - For switch, there are a number of blocks based on the cases.
+    //
+    // In all cases, the merge block is the last block in this list.  When the conditional is done
+    // with, that's the block that will be made "current" and future instructions written to.  The
+    // merge block is also the branch target of "break" instructions.
+    //
+    // For loops, the continue target block is the one before last block in this list.
+    std::vector<spirv::IdRef> blockIds;
+
+    // Up to which block is already generated.  Used by nextConditionalBlock() to generate a block
+    // and give it an id pre-determined in blockIds.
+    size_t nextBlockToWrite = 0;
+
+    // Used to determine if continue will affect this (i.e. it's a loop).
+    bool isContinuable = false;
+    // Used to determine if break will affect this (i.e. it's a loop or switch).
+    bool isBreakable = false;
 };
 
 // Helper class to construct SPIR-V
 class SPIRVBuilder : angle::NonCopyable
 {
   public:
-    SPIRVBuilder(gl::ShaderType shaderType, ShHashFunction64 hashFunction, NameMap &nameMap)
-        : mShaderType(shaderType),
+    SPIRVBuilder(TCompiler *compiler,
+                 ShCompileOptions compileOptions,
+                 ShHashFunction64 hashFunction,
+                 NameMap &nameMap)
+        : mCompiler(compiler),
+          mCompileOptions(compileOptions),
+          mShaderType(gl::FromGLenum<gl::ShaderType>(compiler->getShaderType())),
           mNextAvailableId(1),
           mHashFunction(hashFunction),
           mNameMap(nameMap),
@@ -169,26 +227,69 @@ class SPIRVBuilder : angle::NonCopyable
     {}
 
     spirv::IdRef getNewId();
+    SpirvType getSpirvType(const TType &type, TLayoutBlockStorage blockStorage) const;
     const SpirvTypeData &getTypeData(const TType &type, TLayoutBlockStorage blockStorage);
     const SpirvTypeData &getSpirvTypeData(const SpirvType &type, const char *blockName);
     spirv::IdRef getTypePointerId(spirv::IdRef typeId, spv::StorageClass storageClass);
     spirv::IdRef getFunctionTypeId(spirv::IdRef returnTypeId, const spirv::IdRefList &paramTypeIds);
 
-    spirv::Blob *getSpirvExecutionModes() { return &mSpirvExecutionModes; }
     spirv::Blob *getSpirvDebug() { return &mSpirvDebug; }
     spirv::Blob *getSpirvDecorations() { return &mSpirvDecorations; }
+    spirv::Blob *getSpirvTypeAndConstantDecls() { return &mSpirvTypeAndConstantDecls; }
+    spirv::Blob *getSpirvTypePointerDecls() { return &mSpirvTypePointerDecls; }
+    spirv::Blob *getSpirvFunctionTypeDecls() { return &mSpirvFunctionTypeDecls; }
     spirv::Blob *getSpirvVariableDecls() { return &mSpirvVariableDecls; }
     spirv::Blob *getSpirvFunctions() { return &mSpirvFunctions; }
+    spirv::Blob *getSpirvCurrentFunctionBlock()
+    {
+        ASSERT(!mSpirvCurrentFunctionBlocks.empty() &&
+               !mSpirvCurrentFunctionBlocks.back().isTerminated);
+        return &mSpirvCurrentFunctionBlocks.back().body;
+    }
+    bool isCurrentFunctionBlockTerminated() const
+    {
+        ASSERT(!mSpirvCurrentFunctionBlocks.empty());
+        return mSpirvCurrentFunctionBlocks.back().isTerminated;
+    }
+    void terminateCurrentFunctionBlock()
+    {
+        ASSERT(!mSpirvCurrentFunctionBlocks.empty());
+        mSpirvCurrentFunctionBlocks.back().isTerminated = true;
+    }
+    SpirvConditional *getCurrentConditional() { return &mConditionalStack.back(); }
 
     void addCapability(spv::Capability capability);
-    void addExecutionMode(spv::ExecutionMode executionMode);
     void setEntryPointId(spirv::IdRef id);
     void addEntryPointInterfaceVariableId(spirv::IdRef id);
     void writePerVertexBuiltIns(const TType &type, spirv::IdRef typeId);
     void writeInterfaceVariableDecorations(const TType &type, spirv::IdRef variableId);
 
-    uint32_t calculateBaseAlignmentAndSize(const SpirvType &type, uint32_t *sizeInStorageBlockOut);
+    uint32_t calculateBaseAlignmentAndSize(const SpirvType &type,
+                                           uint32_t *sizeInStorageBlockOut,
+                                           uint32_t *matrixStrideOut);
     uint32_t calculateSizeAndWriteOffsetDecorations(const SpirvType &type, spirv::IdRef typeId);
+
+    spirv::IdRef getBoolConstant(bool value);
+    spirv::IdRef getUintConstant(uint32_t value);
+    spirv::IdRef getIntConstant(int32_t value);
+    spirv::IdRef getFloatConstant(float value);
+    spirv::IdRef getCompositeConstant(spirv::IdRef typeId, const spirv::IdRefList &values);
+
+    // Helpers to start and end a function.
+    void startNewFunction(spirv::IdRef functionId, const char *name);
+    void assembleSpirvFunctionBlocks();
+
+    // Helper to declare a variable.  Function-local variables must be placed in the first block of
+    // the current function.
+    spirv::IdRef declareVariable(spirv::IdRef typeId,
+                                 spv::StorageClass storageClass,
+                                 spirv::IdRef *initializerId,
+                                 const char *name);
+
+    // Helpers for conditionals.
+    void startConditional(size_t blockCount, bool isContinuable, bool isBreakable);
+    void nextConditionalBlock();
+    void endConditional();
 
     // TODO: remove name hashing once translation through glslang is removed.  That is necessary to
     // avoid name collision between ANGLE's internal symbols and user-defined ones when compiling
@@ -215,29 +316,23 @@ class SPIRVBuilder : angle::NonCopyable
                                 spirv::LiteralInteger *sampledOut);
     spv::ImageFormat getImageFormat(TLayoutImageInternalFormat imageInternalFormat);
 
-    spirv::IdRef getBoolConstant(bool value);
     spirv::IdRef getBasicConstantHelper(uint32_t value,
                                         TBasicType type,
                                         angle::HashMap<uint32_t, spirv::IdRef> *constants);
-    spirv::IdRef getUintConstant(uint32_t value);
-    spirv::IdRef getIntConstant(int32_t value);
-    spirv::IdRef getFloatConstant(float value);
-    spirv::IdRef getCompositeConstant(spirv::IdRef typeId, const spirv::IdRefList &values);
 
     uint32_t nextUnusedBinding();
     uint32_t nextUnusedInputLocation(uint32_t consumedCount);
     uint32_t nextUnusedOutputLocation(uint32_t consumedCount);
 
+    void generateExecutionModes(spirv::Blob *blob);
+
+    ANGLE_MAYBE_UNUSED TCompiler *mCompiler;
+    ANGLE_MAYBE_UNUSED ShCompileOptions mCompileOptions;
     gl::ShaderType mShaderType;
 
     // Capabilities the shader is using.  Accumulated as the instructions are generated.  The Shader
     // capability is unconditionally generated, so it's not tracked.
     std::set<spv::Capability> mCapabilities;
-
-    // Execution modes the shader is enabling.  Accumulated as the instructions are generated.
-    // Execution mode instructions that require a parameter are written to mSpirvExecutionModes as
-    // instructions; they are always generated once so don't benefit from being in a std::set.
-    std::set<spv::ExecutionMode> mExecutionModes;
 
     // The list of interface variables and the id of main() populated as the instructions are
     // generated.  Used for the OpEntryPoint instruction.
@@ -253,15 +348,22 @@ class SPIRVBuilder : angle::NonCopyable
     angle::HashMap<SpirvType, SpirvTypeData, SpirvTypeHash> mTypeMap;
 
     // Various sections of SPIR-V.  Each section grows as SPIR-V is generated, and the final result
-    // is obtained by stiching the sections together.  This puts the instructions in the order
+    // is obtained by stitching the sections together.  This puts the instructions in the order
     // required by the spec.
-    spirv::Blob mSpirvExecutionModes;
     spirv::Blob mSpirvDebug;
     spirv::Blob mSpirvDecorations;
     spirv::Blob mSpirvTypeAndConstantDecls;
     spirv::Blob mSpirvTypePointerDecls;
+    spirv::Blob mSpirvFunctionTypeDecls;
     spirv::Blob mSpirvVariableDecls;
     spirv::Blob mSpirvFunctions;
+    // A list of blocks created for the current function.  These are assembled by
+    // assembleSpirvFunctionBlocks() when the function is entirely visited.  Local variables need to
+    // be inserted at the beginning of the first function block, so the entire SPIR-V of the
+    // function cannot be obtained until it's fully visited.
+    //
+    // The last block in this list is the one currently being written to.
+    std::vector<SpirvBlock> mSpirvCurrentFunctionBlocks;
 
     // List of constants that are already defined (for reuse).
     spirv::IdRef mBoolConstants[2];
@@ -279,6 +381,13 @@ class SPIRVBuilder : angle::NonCopyable
 
     // List of function types that are already defined.
     angle::HashMap<SpirvIdAndIdList, spirv::IdRef, SpirvIdAndIdListHash> mFunctionTypeIdMap;
+
+    // Stack of conditionals.  When an if, loop or switch is visited, a new conditional scope is
+    // added.  When the conditional construct is entirely visited, it's popped.  As the blocks of
+    // the conditional constructs are visited, ids are consumed from the top of the stack.  When
+    // break or continue is visited, the stack is traversed backwards until a loop or switch is
+    // found.
+    std::vector<SpirvConditional> mConditionalStack;
 
     // name hashing.
     ShHashFunction64 mHashFunction;

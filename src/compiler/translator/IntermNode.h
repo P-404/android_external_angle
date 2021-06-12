@@ -495,18 +495,12 @@ class TIntermBinary : public TIntermOperator
     TIntermTyped *getRight() const { return mRight; }
     TIntermTyped *fold(TDiagnostics *diagnostics) override;
 
-    void setAddIndexClamp() { mAddIndexClamp = true; }
-    bool getAddIndexClamp() const { return mAddIndexClamp; }
-
     // This method is only valid for EOpIndexDirectStruct. It returns the name of the field.
     const ImmutableString &getIndexStructFieldName() const;
 
   protected:
     TIntermTyped *mLeft;
     TIntermTyped *mRight;
-
-    // If set to true, wrap any EOpIndexIndirect with a clamp to bounds.
-    bool mAddIndexClamp;
 
   private:
     void promote();
@@ -674,6 +668,7 @@ class TIntermBlock : public TIntermNode, public TIntermAggregateBase
 {
   public:
     TIntermBlock() : TIntermNode(), mIsTreeRoot(false) {}
+    TIntermBlock(std::initializer_list<TIntermNode *> stmts);
     ~TIntermBlock() override {}
 
     TIntermBlock *getAsBlock() override { return this; }
@@ -784,6 +779,9 @@ class TIntermDeclaration : public TIntermNode, public TIntermAggregateBase
 {
   public:
     TIntermDeclaration() : TIntermNode() {}
+    TIntermDeclaration(const TVariable *var, TIntermTyped *initExpr);
+    TIntermDeclaration(std::initializer_list<const TVariable *> declarators);
+    TIntermDeclaration(std::initializer_list<TIntermTyped *> declarators);
     ~TIntermDeclaration() override {}
 
     TIntermDeclaration *getAsDeclarationNode() override { return this; }

@@ -14,8 +14,6 @@
 namespace cl
 {
 
-Image::~Image() = default;
-
 cl_int Image::getInfo(ImageInfo name, size_t valueSize, void *value, size_t *valueSizeRet) const
 {
     size_t valSizeT       = 0u;
@@ -59,7 +57,7 @@ cl_int Image::getInfo(ImageInfo name, size_t valueSize, void *value, size_t *val
             copySize  = sizeof(mDesc.arraySize);
             break;
         case ImageInfo::Buffer:
-            valPointer = static_cast<cl_mem>(mParent.get());
+            valPointer = Memory::CastNative(mParent.get());
             copyValue  = &valPointer;
             copySize   = sizeof(valPointer);
             break;
@@ -77,6 +75,8 @@ cl_int Image::getInfo(ImageInfo name, size_t valueSize, void *value, size_t *val
 
     if (value != nullptr)
     {
+        // CL_INVALID_VALUE if size in bytes specified by param_value_size is < size of return type
+        // as described in the Image Object Queries table and param_value is not NULL.
         if (valueSize < copySize)
         {
             return CL_INVALID_VALUE;
@@ -99,7 +99,7 @@ bool Image::IsValid(const _cl_mem *image)
     {
         return false;
     }
-    switch (static_cast<const Memory *>(image)->getType())
+    switch (image->cast<Memory>().getType())
     {
         case CL_MEM_OBJECT_IMAGE1D:
         case CL_MEM_OBJECT_IMAGE2D:
@@ -114,14 +114,40 @@ bool Image::IsValid(const _cl_mem *image)
     return true;
 }
 
+Image::~Image() = default;
+
+bool Image::isRegionValid(const size_t origin[3], const size_t region[3]) const
+{
+    switch (getType())
+    {
+        case CL_MEM_OBJECT_IMAGE1D:
+        case CL_MEM_OBJECT_IMAGE1D_BUFFER:
+            return origin[0] + region[0] <= mDesc.width;
+        case CL_MEM_OBJECT_IMAGE2D:
+            return origin[0] + region[0] <= mDesc.width && origin[1] + region[1] <= mDesc.height;
+        case CL_MEM_OBJECT_IMAGE3D:
+            return origin[0] + region[0] <= mDesc.width && origin[1] + region[1] <= mDesc.height &&
+                   origin[2] + region[2] <= mDesc.depth;
+        case CL_MEM_OBJECT_IMAGE1D_ARRAY:
+            return origin[0] + region[0] <= mDesc.width && origin[1] + region[1] <= mDesc.arraySize;
+        case CL_MEM_OBJECT_IMAGE2D_ARRAY:
+            return origin[0] + region[0] <= mDesc.width && origin[1] + region[1] <= mDesc.height &&
+                   origin[2] + region[2] <= mDesc.arraySize;
+        default:
+            ASSERT(false);
+            break;
+    }
+    return false;
+}
+
 Image::Image(Context &context,
              PropArray &&properties,
-             cl_mem_flags flags,
+             MemFlags flags,
              const cl_image_format &format,
              const ImageDescriptor &desc,
              Memory *parent,
              void *hostPtr,
-             cl_int *errcodeRet)
+             cl_int &errorCode)
     : Memory(*this,
              context,
              std::move(properties),
@@ -130,7 +156,7 @@ Image::Image(Context &context,
              desc,
              parent,
              hostPtr,
-             errcodeRet),
+             errorCode),
       mFormat(format),
       mDesc(desc)
 {}
