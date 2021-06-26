@@ -12,6 +12,12 @@
 #include "libANGLE/CLObject.h"
 #include "libANGLE/renderer/CLMemoryImpl.h"
 
+#include "common/Spinlock.h"
+#include "common/SynchronizedValue.h"
+
+#include <atomic>
+#include <stack>
+
 namespace cl
 {
 
@@ -20,6 +26,8 @@ class Memory : public _cl_mem, public Object
   public:
     // Front end entry functions, only called from OpenCL entry points
 
+    cl_int setDestructorCallback(MemoryCB pfnNotify, void *userData);
+
     cl_int getInfo(MemInfo name, size_t valueSize, void *value, size_t *valueSizeRet) const;
 
   public:
@@ -27,7 +35,7 @@ class Memory : public _cl_mem, public Object
 
     ~Memory() override;
 
-    virtual cl_mem_object_type getType() const = 0;
+    virtual MemObjectType getType() const = 0;
 
     const Context &getContext() const;
     const PropArray &getProperties() const;
@@ -40,9 +48,11 @@ class Memory : public _cl_mem, public Object
     template <typename T = rx::CLMemoryImpl>
     T &getImpl() const;
 
-    MemFlags getEffectiveFlags() const;
+    static Memory *Cast(cl_mem memobj);
 
   protected:
+    using CallbackData = std::pair<MemoryCB, void *>;
+
     Memory(const Buffer &buffer,
            Context &context,
            PropArray &&properties,
@@ -77,7 +87,8 @@ class Memory : public _cl_mem, public Object
     const rx::CLMemoryImpl::Ptr mImpl;
     const size_t mSize;
 
-    cl_uint mMapCount = 0u;
+    angle::SynchronizedValue<std::stack<CallbackData>, angle::Spinlock> mDestructorCallbacks;
+    std::atomic<cl_uint> mMapCount;
 
     friend class Buffer;
     friend class Context;
@@ -122,6 +133,11 @@ template <typename T>
 inline T &Memory::getImpl() const
 {
     return static_cast<T &>(*mImpl);
+}
+
+inline Memory *Memory::Cast(cl_mem memobj)
+{
+    return static_cast<Memory *>(memobj);
 }
 
 }  // namespace cl

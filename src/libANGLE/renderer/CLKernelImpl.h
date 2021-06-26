@@ -31,12 +31,12 @@ class CLKernelImpl : angle::NonCopyable
         WorkGroupInfo(WorkGroupInfo &&);
         WorkGroupInfo &operator=(WorkGroupInfo &&);
 
-        size_t mGlobalWorkSize[3]         = {};
-        size_t mWorkGroupSize             = 0u;
-        size_t mCompileWorkGroupSize[3]   = {};
-        cl_ulong mLocalMemSize            = 0u;
-        size_t mPrefWorkGroupSizeMultiple = 0u;
-        cl_ulong mPrivateMemSize          = 0u;
+        std::array<size_t, 3u> globalWorkSize       = {};
+        size_t workGroupSize                        = 0u;
+        std::array<size_t, 3u> compileWorkGroupSize = {};
+        cl_ulong localMemSize                       = 0u;
+        size_t prefWorkGroupSizeMultiple            = 0u;
+        cl_ulong privateMemSize                     = 0u;
     };
 
     struct ArgInfo
@@ -50,13 +50,13 @@ class CLKernelImpl : angle::NonCopyable
         ArgInfo(ArgInfo &&);
         ArgInfo &operator=(ArgInfo &&);
 
-        bool isAvailable() const { return !mName.empty(); }
+        bool isAvailable() const { return !name.empty(); }
 
-        cl_kernel_arg_address_qualifier mAddressQualifier = 0u;
-        cl_kernel_arg_access_qualifier mAccessQualifier   = 0u;
-        std::string mTypeName;
-        cl_kernel_arg_type_qualifier mTypeQualifier = 0u;
-        std::string mName;
+        cl_kernel_arg_address_qualifier addressQualifier = 0u;
+        cl_kernel_arg_access_qualifier accessQualifier   = 0u;
+        std::string typeName;
+        cl_kernel_arg_type_qualifier typeQualifier = 0u;
+        std::string name;
     };
 
     struct Info
@@ -70,18 +70,20 @@ class CLKernelImpl : angle::NonCopyable
         Info(Info &&);
         Info &operator=(Info &&);
 
-        bool isValid() const { return !mFunctionName.empty(); }
+        bool isValid() const { return !functionName.empty(); }
 
-        std::string mFunctionName;
-        cl_uint mNumArgs = 0u;
-        std::string mAttributes;
+        std::string functionName;
+        cl_uint numArgs = 0u;
+        std::string attributes;
 
-        std::vector<WorkGroupInfo> mWorkGroups;
-        std::vector<ArgInfo> mArgs;
+        std::vector<WorkGroupInfo> workGroups;
+        std::vector<ArgInfo> args;
     };
 
     CLKernelImpl(const cl::Kernel &kernel);
     virtual ~CLKernelImpl();
+
+    virtual cl_int setArg(cl_uint argIndex, size_t argSize, const void *argValue) = 0;
 
     virtual Info createInfo(cl_int &errorCode) const = 0;
 

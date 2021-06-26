@@ -17,12 +17,23 @@
 
 // Include frequently used standard headers
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <list>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
+
+#define ANGLE_CL_TRY(expression)              \
+    do                                        \
+    {                                         \
+        const cl_int _errorCode = expression; \
+        if (_errorCode != CL_SUCCESS)         \
+        {                                     \
+            return _errorCode;                \
+        }                                     \
+    } while (0)
 
 namespace cl
 {
@@ -40,6 +51,7 @@ class Platform;
 class Program;
 class Sampler;
 
+using BufferPtr       = RefPointer<Buffer>;
 using CommandQueuePtr = RefPointer<CommandQueue>;
 using ContextPtr      = RefPointer<Context>;
 using DevicePtr       = RefPointer<Device>;
@@ -50,17 +62,17 @@ using PlatformPtr     = RefPointer<Platform>;
 using ProgramPtr      = RefPointer<Program>;
 using SamplerPtr      = RefPointer<Sampler>;
 
+using BufferPtrs   = std::vector<BufferPtr>;
 using DevicePtrs   = std::vector<DevicePtr>;
 using EventPtrs    = std::vector<EventPtr>;
 using KernelPtrs   = std::vector<KernelPtr>;
+using MemoryPtrs   = std::vector<MemoryPtr>;
 using PlatformPtrs = std::vector<PlatformPtr>;
-
-using Binary   = std::vector<unsigned char>;
-using Binaries = std::vector<Binary>;
+using ProgramPtrs  = std::vector<ProgramPtr>;
 
 struct ImageDescriptor
 {
-    cl_mem_object_type type;
+    MemObjectType type;
     size_t width;
     size_t height;
     size_t depth;

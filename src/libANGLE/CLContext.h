@@ -21,6 +21,8 @@ class Context final : public _cl_context, public Object
   public:
     // Front end entry functions, only called from OpenCL entry points
 
+    static bool IsValidAndVersionOrNewer(const _cl_context *context, cl_uint major, cl_uint minor);
+
     cl_int getInfo(ContextInfo name, size_t valueSize, void *value, size_t *valueSizeRet) const;
 
     cl_command_queue createCommandQueueWithProperties(cl_device_id device,
@@ -62,6 +64,12 @@ class Context final : public _cl_context, public Object
                          void *hostPtr,
                          cl_int &errorCode);
 
+    cl_int getSupportedImageFormats(MemFlags flags,
+                                    MemObjectType imageType,
+                                    cl_uint numEntries,
+                                    cl_image_format *imageFormats,
+                                    cl_uint *numImageFormats);
+
     cl_sampler createSamplerWithProperties(const cl_sampler_properties *properties,
                                            cl_int &errorCode);
 
@@ -89,11 +97,18 @@ class Context final : public _cl_context, public Object
                                                const char *kernelNames,
                                                cl_int &errorCode);
 
+    cl_program linkProgram(cl_uint numDevices,
+                           const cl_device_id *deviceList,
+                           const char *options,
+                           cl_uint numInputPrograms,
+                           const cl_program *inputPrograms,
+                           ProgramCB pfnNotify,
+                           void *userData,
+                           cl_int &errorCode);
+
     cl_event createUserEvent(cl_int &errorCode);
 
     cl_int waitForEvents(cl_uint numEvents, const cl_event *eventList);
-
-    static bool IsValidAndVersionOrNewer(const _cl_context *context, cl_uint major, cl_uint minor);
 
   public:
     using PropArray = std::vector<cl_context_properties>;
@@ -163,9 +178,7 @@ inline const DevicePtrs &Context::getDevices() const
 
 inline bool Context::hasDevice(const _cl_device_id *device) const
 {
-    return std::find_if(mDevices.cbegin(), mDevices.cend(), [=](const DevicePtr &ptr) {
-               return ptr.get() == device;
-           }) != mDevices.cend();
+    return std::find(mDevices.cbegin(), mDevices.cend(), device) != mDevices.cend();
 }
 
 template <typename T>
@@ -177,14 +190,14 @@ inline T &Context::getImpl() const
 inline bool Context::supportsImages() const
 {
     return (std::find_if(mDevices.cbegin(), mDevices.cend(), [](const DevicePtr &ptr) {
-                return ptr->getInfo().mImageSupport == CL_TRUE;
+                return ptr->getInfo().imageSupport == CL_TRUE;
             }) != mDevices.cend());
 }
 
 inline bool Context::supportsIL() const
 {
     return (std::find_if(mDevices.cbegin(), mDevices.cend(), [](const DevicePtr &ptr) {
-                return !ptr->getInfo().mIL_Version.empty();
+                return !ptr->getInfo().IL_Version.empty();
             }) != mDevices.cend());
 }
 

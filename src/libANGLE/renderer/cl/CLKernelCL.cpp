@@ -7,13 +7,19 @@
 
 #include "libANGLE/renderer/cl/CLKernelCL.h"
 
+#include "libANGLE/renderer/cl/CLCommandQueueCL.h"
+#include "libANGLE/renderer/cl/CLContextCL.h"
 #include "libANGLE/renderer/cl/CLDeviceCL.h"
+#include "libANGLE/renderer/cl/CLMemoryCL.h"
+#include "libANGLE/renderer/cl/CLSamplerCL.h"
 
+#include "libANGLE/CLCommandQueue.h"
 #include "libANGLE/CLContext.h"
 #include "libANGLE/CLKernel.h"
+#include "libANGLE/CLMemory.h"
 #include "libANGLE/CLPlatform.h"
 #include "libANGLE/CLProgram.h"
-#include "libANGLE/Debug.h"
+#include "libANGLE/CLSampler.h"
 
 namespace rx
 {
@@ -42,7 +48,11 @@ bool GetArgInfo(cl_kernel kernel,
 {
     errorCode = kernel->getDispatch().clGetKernelArgInfo(kernel, index, cl::ToCLenum(name),
                                                          sizeof(T), &value, nullptr);
-    return errorCode == CL_SUCCESS || errorCode == CL_KERNEL_ARG_INFO_NOT_AVAILABLE;
+    if (errorCode == CL_KERNEL_ARG_INFO_NOT_AVAILABLE)
+    {
+        errorCode = CL_SUCCESS;
+    }
+    return errorCode == CL_SUCCESS;
 }
 
 template <typename T>
@@ -64,6 +74,7 @@ bool GetArgString(cl_kernel kernel,
                                                          nullptr, &size);
     if (errorCode == CL_KERNEL_ARG_INFO_NOT_AVAILABLE)
     {
+        errorCode = CL_SUCCESS;
         return true;
     }
     else if (errorCode != CL_SUCCESS)
@@ -115,58 +126,101 @@ CLKernelCL::~CLKernelCL()
     }
 }
 
+cl_int CLKernelCL::setArg(cl_uint argIndex, size_t argSize, const void *argValue)
+{
+    void *value = nullptr;
+    if (argValue != nullptr)
+    {
+        // If argument is a CL object, fetch the mapped value
+        const CLContextCL &ctx = mKernel.getProgram().getContext().getImpl<CLContextCL>();
+        if (argSize == sizeof(cl_mem))
+        {
+            cl_mem memory = *static_cast<const cl_mem *>(argValue);
+            if (ctx.hasMemory(memory))
+            {
+                value = memory->cast<cl::Memory>().getImpl<CLMemoryCL>().getNative();
+            }
+        }
+        if (value == nullptr && argSize == sizeof(cl_sampler))
+        {
+            cl_sampler sampler = *static_cast<const cl_sampler *>(argValue);
+            if (ctx.hasSampler(sampler))
+            {
+                value = sampler->cast<cl::Sampler>().getImpl<CLSamplerCL>().getNative();
+            }
+        }
+        if (value == nullptr && argSize == sizeof(cl_command_queue))
+        {
+            cl_command_queue queue = *static_cast<const cl_command_queue *>(argValue);
+            if (ctx.hasDeviceQueue(queue))
+            {
+                value = queue->cast<cl::CommandQueue>().getImpl<CLCommandQueueCL>().getNative();
+            }
+        }
+    }
+
+    // If mapped value was found, use it instead of original value
+    if (value != nullptr)
+    {
+        argValue = &value;
+    }
+    return mNative->getDispatch().clSetKernelArg(mNative, argIndex, argSize, argValue);
+}
+
 CLKernelImpl::Info CLKernelCL::createInfo(cl_int &errorCode) const
 {
     const cl::Context &ctx = mKernel.getProgram().getContext();
     Info info;
 
-    if (!GetKernelString(mNative, cl::KernelInfo::FunctionName, info.mFunctionName, errorCode) ||
-        !GetKernelInfo(mNative, cl::KernelInfo::NumArgs, info.mNumArgs, errorCode) ||
+    if (!GetKernelString(mNative, cl::KernelInfo::FunctionName, info.functionName, errorCode) ||
+        !GetKernelInfo(mNative, cl::KernelInfo::NumArgs, info.numArgs, errorCode) ||
         (ctx.getPlatform().isVersionOrNewer(1u, 2u) &&
-         !GetKernelString(mNative, cl::KernelInfo::Attributes, info.mAttributes, errorCode)))
+         !GetKernelString(mNative, cl::KernelInfo::Attributes, info.attributes, errorCode)))
     {
         return Info{};
     }
 
-    info.mWorkGroups.resize(ctx.getDevices().size());
+    info.workGroups.resize(ctx.getDevices().size());
     for (size_t index = 0u; index < ctx.getDevices().size(); ++index)
     {
         const cl_device_id device = ctx.getDevices()[index]->getImpl<CLDeviceCL>().getNative();
-        WorkGroupInfo &workGroup  = info.mWorkGroups[index];
+        WorkGroupInfo &workGroup  = info.workGroups[index];
+
         if ((ctx.getPlatform().isVersionOrNewer(1u, 2u) &&
+             ctx.getDevices()[index]->supportsBuiltInKernel(info.functionName) &&
              !GetWorkGroupInfo(mNative, device, cl::KernelWorkGroupInfo::GlobalWorkSize,
-                               workGroup.mGlobalWorkSize, errorCode)) ||
+                               workGroup.globalWorkSize, errorCode)) ||
             !GetWorkGroupInfo(mNative, device, cl::KernelWorkGroupInfo::WorkGroupSize,
-                              workGroup.mWorkGroupSize, errorCode) ||
+                              workGroup.workGroupSize, errorCode) ||
             !GetWorkGroupInfo(mNative, device, cl::KernelWorkGroupInfo::CompileWorkGroupSize,
-                              workGroup.mCompileWorkGroupSize, errorCode) ||
+                              workGroup.compileWorkGroupSize, errorCode) ||
             !GetWorkGroupInfo(mNative, device, cl::KernelWorkGroupInfo::LocalMemSize,
-                              workGroup.mLocalMemSize, errorCode) ||
+                              workGroup.localMemSize, errorCode) ||
             !GetWorkGroupInfo(mNative, device,
                               cl::KernelWorkGroupInfo::PreferredWorkGroupSizeMultiple,
-                              workGroup.mPrefWorkGroupSizeMultiple, errorCode) ||
+                              workGroup.prefWorkGroupSizeMultiple, errorCode) ||
             !GetWorkGroupInfo(mNative, device, cl::KernelWorkGroupInfo::PrivateMemSize,
-                              workGroup.mPrivateMemSize, errorCode))
+                              workGroup.privateMemSize, errorCode))
         {
             return Info{};
         }
     }
 
-    info.mArgs.resize(info.mNumArgs);
+    info.args.resize(info.numArgs);
     if (ctx.getPlatform().isVersionOrNewer(1u, 2u))
     {
-        for (cl_uint index = 0u; index < info.mNumArgs; ++index)
+        for (cl_uint index = 0u; index < info.numArgs; ++index)
         {
-            ArgInfo &arg = info.mArgs[index];
+            ArgInfo &arg = info.args[index];
             if (!GetArgInfo(mNative, index, cl::KernelArgInfo::AddressQualifier,
-                            arg.mAddressQualifier, errorCode) ||
-                !GetArgInfo(mNative, index, cl::KernelArgInfo::AccessQualifier,
-                            arg.mAccessQualifier, errorCode) ||
-                !GetArgString(mNative, index, cl::KernelArgInfo::TypeName, arg.mTypeName,
-                              errorCode) ||
-                !GetArgInfo(mNative, index, cl::KernelArgInfo::TypeQualifier, arg.mTypeQualifier,
+                            arg.addressQualifier, errorCode) ||
+                !GetArgInfo(mNative, index, cl::KernelArgInfo::AccessQualifier, arg.accessQualifier,
                             errorCode) ||
-                !GetArgString(mNative, index, cl::KernelArgInfo::Name, arg.mName, errorCode))
+                !GetArgString(mNative, index, cl::KernelArgInfo::TypeName, arg.typeName,
+                              errorCode) ||
+                !GetArgInfo(mNative, index, cl::KernelArgInfo::TypeQualifier, arg.typeQualifier,
+                            errorCode) ||
+                !GetArgString(mNative, index, cl::KernelArgInfo::Name, arg.name, errorCode))
             {
                 return Info{};
             }

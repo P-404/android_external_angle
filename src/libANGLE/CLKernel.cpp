@@ -15,6 +15,11 @@
 namespace cl
 {
 
+cl_int Kernel::setArg(cl_uint argIndex, size_t argSize, const void *argValue)
+{
+    return mImpl->setArg(argIndex, argSize, argValue);
+}
+
 cl_int Kernel::getInfo(KernelInfo name, size_t valueSize, void *value, size_t *valueSizeRet) const
 {
     cl_uint valUInt       = 0u;
@@ -25,12 +30,12 @@ cl_int Kernel::getInfo(KernelInfo name, size_t valueSize, void *value, size_t *v
     switch (name)
     {
         case KernelInfo::FunctionName:
-            copyValue = mInfo.mFunctionName.c_str();
-            copySize  = mInfo.mFunctionName.length() + 1u;
+            copyValue = mInfo.functionName.c_str();
+            copySize  = mInfo.functionName.length() + 1u;
             break;
         case KernelInfo::NumArgs:
-            copyValue = &mInfo.mNumArgs;
-            copySize  = sizeof(mInfo.mNumArgs);
+            copyValue = &mInfo.numArgs;
+            copySize  = sizeof(mInfo.numArgs);
             break;
         case KernelInfo::ReferenceCount:
             valUInt   = getRefCount();
@@ -48,8 +53,8 @@ cl_int Kernel::getInfo(KernelInfo name, size_t valueSize, void *value, size_t *v
             copySize   = sizeof(valPointer);
             break;
         case KernelInfo::Attributes:
-            copyValue = mInfo.mAttributes.c_str();
-            copySize  = mInfo.mAttributes.length() + 1u;
+            copyValue = mInfo.attributes.c_str();
+            copySize  = mInfo.attributes.length() + 1u;
             break;
         default:
             return CL_INVALID_VALUE;
@@ -85,7 +90,7 @@ cl_int Kernel::getWorkGroupInfo(cl_device_id device,
     if (device != nullptr)
     {
         const DevicePtrs &devices = mProgram->getContext().getDevices();
-        while (index < devices.size() && devices[index].get() != device)
+        while (index < devices.size() && devices[index] != device)
         {
             ++index;
         }
@@ -94,7 +99,7 @@ cl_int Kernel::getWorkGroupInfo(cl_device_id device,
             return CL_INVALID_DEVICE;
         }
     }
-    const rx::CLKernelImpl::WorkGroupInfo &info = mInfo.mWorkGroups[index];
+    const rx::CLKernelImpl::WorkGroupInfo &info = mInfo.workGroups[index];
 
     const void *copyValue = nullptr;
     size_t copySize       = 0u;
@@ -102,28 +107,28 @@ cl_int Kernel::getWorkGroupInfo(cl_device_id device,
     switch (name)
     {
         case KernelWorkGroupInfo::GlobalWorkSize:
-            copyValue = &info.mGlobalWorkSize;
-            copySize  = sizeof(info.mGlobalWorkSize);
+            copyValue = &info.globalWorkSize;
+            copySize  = sizeof(info.globalWorkSize);
             break;
         case KernelWorkGroupInfo::WorkGroupSize:
-            copyValue = &info.mWorkGroupSize;
-            copySize  = sizeof(info.mWorkGroupSize);
+            copyValue = &info.workGroupSize;
+            copySize  = sizeof(info.workGroupSize);
             break;
         case KernelWorkGroupInfo::CompileWorkGroupSize:
-            copyValue = &info.mCompileWorkGroupSize;
-            copySize  = sizeof(info.mCompileWorkGroupSize);
+            copyValue = &info.compileWorkGroupSize;
+            copySize  = sizeof(info.compileWorkGroupSize);
             break;
         case KernelWorkGroupInfo::LocalMemSize:
-            copyValue = &info.mLocalMemSize;
-            copySize  = sizeof(info.mLocalMemSize);
+            copyValue = &info.localMemSize;
+            copySize  = sizeof(info.localMemSize);
             break;
         case KernelWorkGroupInfo::PreferredWorkGroupSizeMultiple:
-            copyValue = &info.mPrefWorkGroupSizeMultiple;
-            copySize  = sizeof(info.mPrefWorkGroupSizeMultiple);
+            copyValue = &info.prefWorkGroupSizeMultiple;
+            copySize  = sizeof(info.prefWorkGroupSizeMultiple);
             break;
         case KernelWorkGroupInfo::PrivateMemSize:
-            copyValue = &info.mPrivateMemSize;
-            copySize  = sizeof(info.mPrivateMemSize);
+            copyValue = &info.privateMemSize;
+            copySize  = sizeof(info.privateMemSize);
             break;
         default:
             return CL_INVALID_VALUE;
@@ -155,31 +160,31 @@ cl_int Kernel::getArgInfo(cl_uint argIndex,
                           void *value,
                           size_t *valueSizeRet) const
 {
-    const rx::CLKernelImpl::ArgInfo &info = mInfo.mArgs[argIndex];
+    const rx::CLKernelImpl::ArgInfo &info = mInfo.args[argIndex];
     const void *copyValue                 = nullptr;
     size_t copySize                       = 0u;
 
     switch (name)
     {
         case KernelArgInfo::AddressQualifier:
-            copyValue = &info.mAddressQualifier;
-            copySize  = sizeof(info.mAddressQualifier);
+            copyValue = &info.addressQualifier;
+            copySize  = sizeof(info.addressQualifier);
             break;
         case KernelArgInfo::AccessQualifier:
-            copyValue = &info.mAccessQualifier;
-            copySize  = sizeof(info.mAccessQualifier);
+            copyValue = &info.accessQualifier;
+            copySize  = sizeof(info.accessQualifier);
             break;
         case KernelArgInfo::TypeName:
-            copyValue = info.mTypeName.c_str();
-            copySize  = info.mTypeName.length() + 1u;
+            copyValue = info.typeName.c_str();
+            copySize  = info.typeName.length() + 1u;
             break;
         case KernelArgInfo::TypeQualifier:
-            copyValue = &info.mTypeQualifier;
-            copySize  = sizeof(info.mTypeQualifier);
+            copyValue = &info.typeQualifier;
+            copySize  = sizeof(info.typeQualifier);
             break;
         case KernelArgInfo::Name:
-            copyValue = info.mName.c_str();
-            copySize  = info.mName.length() + 1u;
+            copyValue = info.name.c_str();
+            copySize  = info.name.length() + 1u;
             break;
         default:
             return CL_INVALID_VALUE;
@@ -205,16 +210,23 @@ cl_int Kernel::getArgInfo(cl_uint argIndex,
     return CL_SUCCESS;
 }
 
-Kernel::~Kernel() = default;
+Kernel::~Kernel()
+{
+    --mProgram->mNumAttachedKernels;
+}
 
 Kernel::Kernel(Program &program, const char *name, cl_int &errorCode)
     : mProgram(&program),
       mImpl(program.getImpl().createKernel(*this, name, errorCode)),
       mInfo(mImpl ? mImpl->createInfo(errorCode) : rx::CLKernelImpl::Info{})
-{}
+{
+    ++mProgram->mNumAttachedKernels;
+}
 
 Kernel::Kernel(Program &program, const rx::CLKernelImpl::CreateFunc &createFunc, cl_int &errorCode)
     : mProgram(&program), mImpl(createFunc(*this)), mInfo(mImpl->createInfo(errorCode))
-{}
+{
+    ++mProgram->mNumAttachedKernels;
+}
 
 }  // namespace cl

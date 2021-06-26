@@ -131,12 +131,17 @@ cl_mem Context::createImage(const cl_mem_properties *properties,
                             void *hostPtr,
                             cl_int &errorCode)
 {
-    const ImageDescriptor imageDesc = {
-        desc->image_type,        desc->image_width,      desc->image_height,
-        desc->image_depth,       desc->image_array_size, desc->image_row_pitch,
-        desc->image_slice_pitch, desc->num_mip_levels,   desc->num_samples};
+    const ImageDescriptor imageDesc = {FromCLenum<MemObjectType>(desc->image_type),
+                                       desc->image_width,
+                                       desc->image_height,
+                                       desc->image_depth,
+                                       desc->image_array_size,
+                                       desc->image_row_pitch,
+                                       desc->image_slice_pitch,
+                                       desc->num_mip_levels,
+                                       desc->num_samples};
     return Object::Create<Image>(errorCode, *this, Memory::PropArray{}, flags, *format, imageDesc,
-                                 &desc->buffer->cast<Memory>(), hostPtr);
+                                 Memory::Cast(desc->buffer), hostPtr);
 }
 
 cl_mem Context::createImage2D(MemFlags flags,
@@ -148,7 +153,7 @@ cl_mem Context::createImage2D(MemFlags flags,
                               cl_int &errorCode)
 {
     const ImageDescriptor imageDesc = {
-        CL_MEM_OBJECT_IMAGE2D, width, height, 0u, 0u, rowPitch, 0u, 0u, 0u};
+        MemObjectType::Image2D, width, height, 0u, 0u, rowPitch, 0u, 0u, 0u};
     return Object::Create<Image>(errorCode, *this, Memory::PropArray{}, flags, *format, imageDesc,
                                  nullptr, hostPtr);
 }
@@ -164,9 +169,19 @@ cl_mem Context::createImage3D(MemFlags flags,
                               cl_int &errorCode)
 {
     const ImageDescriptor imageDesc = {
-        CL_MEM_OBJECT_IMAGE3D, width, height, depth, 0u, rowPitch, slicePitch, 0u, 0u};
+        MemObjectType::Image3D, width, height, depth, 0u, rowPitch, slicePitch, 0u, 0u};
     return Object::Create<Image>(errorCode, *this, Memory::PropArray{}, flags, *format, imageDesc,
                                  nullptr, hostPtr);
+}
+
+cl_int Context::getSupportedImageFormats(MemFlags flags,
+                                         MemObjectType imageType,
+                                         cl_uint numEntries,
+                                         cl_image_format *imageFormats,
+                                         cl_uint *numImageFormats)
+{
+    return mImpl->getSupportedImageFormats(flags, imageType, numEntries, imageFormats,
+                                           numImageFormats);
 }
 
 cl_sampler Context::createSamplerWithProperties(const cl_sampler_properties *properties,
@@ -258,16 +273,12 @@ cl_program Context::createProgramWithBinary(cl_uint numDevices,
                                             cl_int &errorCode)
 {
     DevicePtrs devs;
-    Binaries bins;
     devs.reserve(numDevices);
-    bins.reserve(numDevices);
     while (numDevices-- != 0u)
     {
         devs.emplace_back(&(*devices++)->cast<Device>());
-        bins.emplace_back(*lengths++);
-        std::memcpy(bins.back().data(), *binaries++, bins.back().size());
     }
-    return Object::Create<Program>(errorCode, *this, std::move(devs), std::move(bins),
+    return Object::Create<Program>(errorCode, *this, std::move(devs), lengths, binaries,
                                    binaryStatus);
 }
 
@@ -283,6 +294,31 @@ cl_program Context::createProgramWithBuiltInKernels(cl_uint numDevices,
         devs.emplace_back(&(*devices++)->cast<Device>());
     }
     return Object::Create<Program>(errorCode, *this, std::move(devs), kernelNames);
+}
+
+cl_program Context::linkProgram(cl_uint numDevices,
+                                const cl_device_id *deviceList,
+                                const char *options,
+                                cl_uint numInputPrograms,
+                                const cl_program *inputPrograms,
+                                ProgramCB pfnNotify,
+                                void *userData,
+                                cl_int &errorCode)
+{
+    DevicePtrs devices;
+    devices.reserve(numDevices);
+    while (numDevices-- != 0u)
+    {
+        devices.emplace_back(&(*deviceList++)->cast<Device>());
+    }
+    ProgramPtrs programs;
+    programs.reserve(numInputPrograms);
+    while (numInputPrograms-- != 0u)
+    {
+        programs.emplace_back(&(*inputPrograms++)->cast<Program>());
+    }
+    return Object::Create<Program>(errorCode, *this, devices, options, programs, pfnNotify,
+                                   userData);
 }
 
 cl_event Context::createUserEvent(cl_int &errorCode)

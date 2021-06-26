@@ -21,7 +21,9 @@ class CLKernelCL : public CLKernelImpl
     CLKernelCL(const cl::Kernel &kernel, cl_kernel native);
     ~CLKernelCL() override;
 
-    cl_kernel getNative();
+    cl_kernel getNative() const;
+
+    cl_int setArg(cl_uint argIndex, size_t argSize, const void *argValue) override;
 
     Info createInfo(cl_int &errorCode) const override;
 
@@ -29,7 +31,7 @@ class CLKernelCL : public CLKernelImpl
     const cl_kernel mNative;
 };
 
-inline cl_kernel CLKernelCL::getNative()
+inline cl_kernel CLKernelCL::getNative() const
 {
     return mNative;
 }

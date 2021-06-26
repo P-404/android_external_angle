@@ -440,6 +440,7 @@ ContextVk::ContextVk(const gl::State &state, gl::ErrorSet *errorSet, RendererVk 
       mEmulateSeamfulCubeMapSampling(false),
       mOutsideRenderPassCommands(nullptr),
       mRenderPassCommands(nullptr),
+      mQueryEventType(GraphicsEventCmdBuf::NotInQueryCmd),
       mGpuEventsEnabled(false),
       mEGLSyncObjectPendingFlush(false),
       mHasDeferredFlush(false),
@@ -455,6 +456,11 @@ ContextVk::ContextVk(const gl::State &state, gl::ErrorSet *errorSet, RendererVk 
     ANGLE_TRACE_EVENT0("gpu.angle", "ContextVk::ContextVk");
     memset(&mClearColorValue, 0, sizeof(mClearColorValue));
     memset(&mClearDepthStencilValue, 0, sizeof(mClearDepthStencilValue));
+    memset(&mViewport, 0, sizeof(mViewport));
+    memset(&mScissor, 0, sizeof(mScissor));
+
+    // Ensure viewport is within Vulkan requirements
+    vk::ClampViewport(&mViewport);
 
     mNonIndexedDirtyBitsMask.set();
     mNonIndexedDirtyBitsMask.reset(DIRTY_BIT_INDEX_BUFFER);
@@ -468,10 +474,12 @@ ContextVk::ContextVk(const gl::State &state, gl::ErrorSet *errorSet, RendererVk 
     // Note that currently these dirty bits are set every time a new render pass command buffer is
     // begun.  However, using ANGLE's SecondaryCommandBuffer, the Vulkan command buffer (which is
     // the primary command buffer) is not ended, so technically we don't need to rebind these.
-    mNewGraphicsCommandBufferDirtyBits = DirtyBits{
-        DIRTY_BIT_RENDER_PASS,     DIRTY_BIT_PIPELINE_BINDING,       DIRTY_BIT_TEXTURES,
-        DIRTY_BIT_VERTEX_BUFFERS,  DIRTY_BIT_INDEX_BUFFER,           DIRTY_BIT_SHADER_RESOURCES,
-        DIRTY_BIT_DESCRIPTOR_SETS, DIRTY_BIT_DRIVER_UNIFORMS_BINDING};
+    mNewGraphicsCommandBufferDirtyBits =
+        DirtyBits{DIRTY_BIT_RENDER_PASS,     DIRTY_BIT_PIPELINE_BINDING,
+                  DIRTY_BIT_TEXTURES,        DIRTY_BIT_VERTEX_BUFFERS,
+                  DIRTY_BIT_INDEX_BUFFER,    DIRTY_BIT_SHADER_RESOURCES,
+                  DIRTY_BIT_DESCRIPTOR_SETS, DIRTY_BIT_DRIVER_UNIFORMS_BINDING,
+                  DIRTY_BIT_VIEWPORT,        DIRTY_BIT_SCISSOR};
     if (getFeatures().supportsTransformFeedbackExtension.enabled)
     {
         mNewGraphicsCommandBufferDirtyBits.set(DIRTY_BIT_TRANSFORM_FEEDBACK_BUFFERS);
@@ -518,6 +526,9 @@ ContextVk::ContextVk(const gl::State &state, gl::ErrorSet *errorSet, RendererVk 
 
     mGraphicsDirtyBitHandlers[DIRTY_BIT_DESCRIPTOR_SETS] =
         &ContextVk::handleDirtyGraphicsDescriptorSets;
+
+    mGraphicsDirtyBitHandlers[DIRTY_BIT_VIEWPORT] = &ContextVk::handleDirtyGraphicsViewport;
+    mGraphicsDirtyBitHandlers[DIRTY_BIT_SCISSOR]  = &ContextVk::handleDirtyGraphicsScissor;
 
     mComputeDirtyBitHandlers[DIRTY_BIT_MEMORY_BARRIER] =
         &ContextVk::handleDirtyComputeMemoryBarrier;
@@ -1980,6 +1991,19 @@ angle::Result ContextVk::handleDirtyGraphicsDescriptorSets(DirtyBits::Iterator *
     return handleDirtyDescriptorSetsImpl(mRenderPassCommandBuffer);
 }
 
+angle::Result ContextVk::handleDirtyGraphicsViewport(DirtyBits::Iterator *dirtyBitsIterator,
+                                                     DirtyBits dirtyBitMask)
+{
+    mRenderPassCommandBuffer->setViewport(0, 1, &mViewport);
+    return angle::Result::Continue;
+}
+angle::Result ContextVk::handleDirtyGraphicsScissor(DirtyBits::Iterator *dirtyBitsIterator,
+                                                    DirtyBits dirtyBitMask)
+{
+    mRenderPassCommandBuffer->setScissor(0, 1, &mScissor);
+    return angle::Result::Continue;
+}
+
 angle::Result ContextVk::handleDirtyComputeDescriptorSets()
 {
     return handleDirtyDescriptorSetsImpl(&mOutsideRenderPassCommands->getCommandBuffer());
@@ -3039,6 +3063,37 @@ void ContextVk::endEventLog(angle::EntryPoint entryPoint, PipelineType pipelineT
         mOutsideRenderPassCommands->getCommandBuffer().endDebugUtilsLabelEXT();
     }
 }
+void ContextVk::endEventLogForClearOrQuery()
+{
+    if (!mRenderer->angleDebuggerMode())
+    {
+        return;
+    }
+
+    vk::CommandBuffer *commandBuffer = nullptr;
+    switch (mQueryEventType)
+    {
+        case GraphicsEventCmdBuf::InOutsideCmdBufQueryCmd:
+            ASSERT(mOutsideRenderPassCommands);
+            commandBuffer = &mOutsideRenderPassCommands->getCommandBuffer();
+            break;
+        case GraphicsEventCmdBuf::InRenderPassCmdBufQueryCmd:
+            ASSERT(mRenderPassCommands);
+            commandBuffer = &mRenderPassCommands->getCommandBuffer();
+            break;
+        case GraphicsEventCmdBuf::NotInQueryCmd:
+            // The glClear* or gl*Query* command was noop'd or otherwise ended early.  We could
+            // call handleDirtyEventLogImpl() to start the hierarchy, but it isn't clear which (if
+            // any) command buffer to use.  We'll just skip processing this command (other than to
+            // let it stay queued for the next time handleDirtyEventLogImpl() is called.
+            return;
+        default:
+            UNREACHABLE();
+    }
+    commandBuffer->endDebugUtilsLabelEXT();
+
+    mQueryEventType = GraphicsEventCmdBuf::NotInQueryCmd;
+}
 
 angle::Result ContextVk::handleNoopDrawEvent()
 {
@@ -3046,9 +3101,31 @@ angle::Result ContextVk::handleNoopDrawEvent()
     return handleDirtyEventLogImpl(mRenderPassCommandBuffer);
 }
 
-angle::Result ContextVk::handleMidRenderPassClearEvent()
+angle::Result ContextVk::handleGraphicsEventLog(GraphicsEventCmdBuf queryEventType)
 {
-    return handleDirtyEventLogImpl(mRenderPassCommandBuffer);
+    ASSERT(mQueryEventType == GraphicsEventCmdBuf::NotInQueryCmd);
+    if (!mRenderer->angleDebuggerMode())
+    {
+        return angle::Result::Continue;
+    }
+
+    mQueryEventType = queryEventType;
+
+    vk::CommandBuffer *commandBuffer = nullptr;
+    switch (mQueryEventType)
+    {
+        case GraphicsEventCmdBuf::InOutsideCmdBufQueryCmd:
+            ASSERT(mOutsideRenderPassCommands);
+            commandBuffer = &mOutsideRenderPassCommands->getCommandBuffer();
+            break;
+        case GraphicsEventCmdBuf::InRenderPassCmdBufQueryCmd:
+            ASSERT(mRenderPassCommands);
+            commandBuffer = &mRenderPassCommands->getCommandBuffer();
+            break;
+        default:
+            UNREACHABLE();
+    }
+    return handleDirtyEventLogImpl(commandBuffer);
 }
 
 bool ContextVk::isViewportFlipEnabledForDrawFBO() const
@@ -3166,7 +3243,6 @@ void ContextVk::updateViewport(FramebufferVk *framebufferVk,
     bool invertViewport =
         isViewportFlipEnabledForDrawFBO() && getFeatures().supportsNegativeViewport.enabled;
 
-    VkViewport vkViewport;
     gl_vk::GetViewport(
         rotatedRect, nearPlane, farPlane, invertViewport,
         // If clip space origin is upper left, viewport origin's y value will be offset by the
@@ -3174,16 +3250,26 @@ void ContextVk::updateViewport(FramebufferVk *framebufferVk,
         mState.getClipSpaceOrigin() == gl::ClipSpaceOrigin::UpperLeft,
         // If the surface is rotated 90/270 degrees, use the framebuffer's width instead of the
         // height for calculating the final viewport.
-        isRotatedAspectRatioForDrawFBO() ? fbDimensions.width : fbDimensions.height, &vkViewport);
+        isRotatedAspectRatioForDrawFBO() ? fbDimensions.width : fbDimensions.height, &mViewport);
 
-    mGraphicsPipelineDesc->updateViewport(&mGraphicsPipelineTransition, vkViewport);
+    // Ensure viewport is within Vulkan requirements
+    vk::ClampViewport(&mViewport);
+
     invalidateGraphicsDriverUniforms();
+    mGraphicsDirtyBits.set(DIRTY_BIT_VIEWPORT);
 }
 
 void ContextVk::updateDepthRange(float nearPlane, float farPlane)
 {
+    // GLES2.0 Section 2.12.1: Each of n and f are clamped to lie within [0, 1], as are all
+    // arguments of type clampf.
+    ASSERT(nearPlane >= 0.0f && nearPlane <= 1.0f);
+    ASSERT(farPlane >= 0.0f && farPlane <= 1.0f);
+    mViewport.minDepth = nearPlane;
+    mViewport.maxDepth = farPlane;
+
     invalidateGraphicsDriverUniforms();
-    mGraphicsPipelineDesc->updateDepthRange(&mGraphicsPipelineTransition, nearPlane, farPlane);
+    mGraphicsDirtyBits.set(DIRTY_BIT_VIEWPORT);
 }
 
 void ContextVk::updateScissor(const gl::State &glState)
@@ -3203,9 +3289,8 @@ void ContextVk::updateScissor(const gl::State &glState)
     gl::Rectangle rotatedScissoredArea;
     RotateRectangle(getRotationDrawFramebuffer(), isViewportFlipEnabledForDrawFBO(),
                     renderArea.width, renderArea.height, scissoredArea, &rotatedScissoredArea);
-
-    mGraphicsPipelineDesc->updateScissor(&mGraphicsPipelineTransition,
-                                         gl_vk::GetRect(rotatedScissoredArea));
+    mScissor = gl_vk::GetRect(rotatedScissoredArea);
+    mGraphicsDirtyBits.set(DIRTY_BIT_SCISSOR);
 
     // If the scissor has grown beyond the previous scissoredRenderArea, grow the render pass render
     // area.  The only undesirable effect this may have is that if the render area does not cover a
@@ -4295,6 +4380,12 @@ void ContextVk::invalidateComputeDescriptorSet(DescriptorSetIndex usedDescriptor
     {
         mComputeDirtyBits.set(DIRTY_BIT_DRIVER_UNIFORMS_BINDING);
     }
+}
+
+void ContextVk::invalidateViewportAndScissor()
+{
+    mGraphicsDirtyBits.set(DIRTY_BIT_VIEWPORT);
+    mGraphicsDirtyBits.set(DIRTY_BIT_SCISSOR);
 }
 
 angle::Result ContextVk::dispatchCompute(const gl::Context *context,
@@ -5533,7 +5624,14 @@ angle::Result ContextVk::flushDirtyGraphicsRenderPass(DirtyBits::Iterator *dirty
 
     ANGLE_TRY(flushCommandsAndEndRenderPassImpl());
 
+    // Set dirty bits that need processing on new render pass on the dirty bits iterator that's
+    // being processed right now.
     dirtyBitsIterator->setLaterBits(mNewGraphicsCommandBufferDirtyBits & dirtyBitMask);
+
+    // Additionally, make sure any dirty bits not included in the mask are left for future
+    // processing.  Note that |dirtyBitMask| is removed from |mNewGraphicsCommandBufferDirtyBits|
+    // after dirty bits are iterated, so there's no need to mask them out.
+    mGraphicsDirtyBits |= mNewGraphicsCommandBufferDirtyBits;
 
     // Restart at subpass 0.
     mGraphicsPipelineDesc->resetSubpass(&mGraphicsPipelineTransition);
@@ -5642,6 +5740,9 @@ angle::Result ContextVk::flushOutsideRenderPassCommands()
 
 angle::Result ContextVk::beginRenderPassQuery(QueryVk *queryVk)
 {
+    // Emit debug-util markers before calling the query command.
+    ANGLE_TRY(handleGraphicsEventLog(rx::GraphicsEventCmdBuf::InRenderPassCmdBufQueryCmd));
+
     // To avoid complexity, we always start and end these queries inside the render pass.  If the
     // render pass has not yet started, the query is deferred until it does.
     if (mRenderPassCommandBuffer)
@@ -5657,8 +5758,11 @@ angle::Result ContextVk::beginRenderPassQuery(QueryVk *queryVk)
     return angle::Result::Continue;
 }
 
-void ContextVk::endRenderPassQuery(QueryVk *queryVk)
+angle::Result ContextVk::endRenderPassQuery(QueryVk *queryVk)
 {
+    // Emit debug-util markers before calling the query command.
+    ANGLE_TRY(handleGraphicsEventLog(rx::GraphicsEventCmdBuf::InRenderPassCmdBufQueryCmd));
+
     if (mRenderPassCommandBuffer)
     {
         queryVk->getQueryHelper()->endRenderPassQuery(this);
@@ -5668,6 +5772,8 @@ void ContextVk::endRenderPassQuery(QueryVk *queryVk)
 
     ASSERT(mActiveRenderPassQueries[type] == queryVk);
     mActiveRenderPassQueries[type] = nullptr;
+
+    return angle::Result::Continue;
 }
 
 void ContextVk::pauseRenderPassQueriesIfActive()

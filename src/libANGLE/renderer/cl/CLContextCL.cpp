@@ -11,6 +11,7 @@
 #include "libANGLE/renderer/cl/CLDeviceCL.h"
 #include "libANGLE/renderer/cl/CLEventCL.h"
 #include "libANGLE/renderer/cl/CLMemoryCL.h"
+#include "libANGLE/renderer/cl/CLPlatformCL.h"
 #include "libANGLE/renderer/cl/CLProgramCL.h"
 #include "libANGLE/renderer/cl/CLSamplerCL.h"
 
@@ -24,6 +25,7 @@
 #include "libANGLE/CLPlatform.h"
 #include "libANGLE/CLProgram.h"
 #include "libANGLE/CLSampler.h"
+#include "libANGLE/cl_utils.h"
 
 namespace rx
 {
@@ -126,6 +128,7 @@ CLMemoryImpl::Ptr CLContextCL::createBuffer(const cl::Buffer &buffer,
 }
 
 CLMemoryImpl::Ptr CLContextCL::createImage(const cl::Image &image,
+                                           cl::MemFlags flags,
                                            const cl_image_format &format,
                                            const cl::ImageDescriptor &desc,
                                            void *hostPtr,
@@ -135,37 +138,37 @@ CLMemoryImpl::Ptr CLContextCL::createImage(const cl::Image &image,
 
     if (mContext.getPlatform().isVersionOrNewer(1u, 2u))
     {
+        const cl_mem_object_type nativeType = cl::ToCLenum(desc.type);
+        const cl_mem nativeParent =
+            image.getParent() ? image.getParent()->getImpl<CLMemoryCL>().getNative() : nullptr;
         const cl_image_desc nativeDesc = {
-            desc.type,       desc.width,
-            desc.height,     desc.depth,
-            desc.arraySize,  desc.rowPitch,
-            desc.slicePitch, desc.numMipLevels,
-            desc.numSamples, {cl::Memory::CastNative(image.getParent().get())}};
+            nativeType,    desc.width,      desc.height,       desc.depth,      desc.arraySize,
+            desc.rowPitch, desc.slicePitch, desc.numMipLevels, desc.numSamples, {nativeParent}};
 
         if (image.getProperties().empty())
         {
-            nativeImage = mNative->getDispatch().clCreateImage(
-                mNative, image.getFlags().get(), &format, &nativeDesc, hostPtr, &errorCode);
+            nativeImage = mNative->getDispatch().clCreateImage(mNative, flags.get(), &format,
+                                                               &nativeDesc, hostPtr, &errorCode);
         }
         else
         {
             nativeImage = mNative->getDispatch().clCreateImageWithProperties(
-                mNative, image.getProperties().data(), image.getFlags().get(), &format, &nativeDesc,
-                hostPtr, &errorCode);
+                mNative, image.getProperties().data(), flags.get(), &format, &nativeDesc, hostPtr,
+                &errorCode);
         }
     }
     else
     {
         switch (desc.type)
         {
-            case CL_MEM_OBJECT_IMAGE2D:
+            case cl::MemObjectType::Image2D:
                 nativeImage = mNative->getDispatch().clCreateImage2D(
-                    mNative, image.getFlags().get(), &format, desc.width, desc.height,
-                    desc.rowPitch, hostPtr, &errorCode);
+                    mNative, flags.get(), &format, desc.width, desc.height, desc.rowPitch, hostPtr,
+                    &errorCode);
                 break;
-            case CL_MEM_OBJECT_IMAGE3D:
+            case cl::MemObjectType::Image3D:
                 nativeImage = mNative->getDispatch().clCreateImage3D(
-                    mNative, image.getFlags().get(), &format, desc.width, desc.height, desc.depth,
+                    mNative, flags.get(), &format, desc.width, desc.height, desc.depth,
                     desc.rowPitch, desc.slicePitch, hostPtr, &errorCode);
                 break;
             default:
@@ -176,6 +179,43 @@ CLMemoryImpl::Ptr CLContextCL::createImage(const cl::Image &image,
     }
 
     return CLMemoryImpl::Ptr(nativeImage != nullptr ? new CLMemoryCL(image, nativeImage) : nullptr);
+}
+
+cl_int CLContextCL::getSupportedImageFormats(cl::MemFlags flags,
+                                             cl::MemObjectType imageType,
+                                             cl_uint numEntries,
+                                             cl_image_format *imageFormats,
+                                             cl_uint *numImageFormats)
+{
+    // Fetch available image formats for given flags and image type.
+    cl_uint numFormats = 0u;
+    ANGLE_CL_TRY(mNative->getDispatch().clGetSupportedImageFormats(
+        mNative, flags.get(), cl::ToCLenum(imageType), 0u, nullptr, &numFormats));
+    std::vector<cl_image_format> formats(numFormats);
+    ANGLE_CL_TRY(mNative->getDispatch().clGetSupportedImageFormats(
+        mNative, flags.get(), cl::ToCLenum(imageType), numFormats, formats.data(), nullptr));
+
+    // Filter out formats which are not supported by front end.
+    const CLPlatformImpl::Info &info = mContext.getPlatform().getInfo();
+    std::vector<cl_image_format> supportedFormats;
+    supportedFormats.reserve(formats.size());
+    std::copy_if(
+        formats.cbegin(), formats.cend(), std::back_inserter(supportedFormats),
+        [&](const cl_image_format &format) { return cl::IsValidImageFormat(&format, info); });
+
+    if (imageFormats != nullptr)
+    {
+        auto formatIt = supportedFormats.cbegin();
+        while (numEntries-- != 0u && formatIt != supportedFormats.cend())
+        {
+            *imageFormats++ = *formatIt++;
+        }
+    }
+    if (numImageFormats != nullptr)
+    {
+        *numImageFormats = static_cast<cl_uint>(supportedFormats.size());
+    }
+    return CL_SUCCESS;
 }
 
 CLSamplerImpl::Ptr CLContextCL::createSampler(const cl::Sampler &sampler, cl_int &errorCode)
@@ -232,26 +272,21 @@ CLProgramImpl::Ptr CLContextCL::createProgramWithIL(const cl::Program &program,
 }
 
 CLProgramImpl::Ptr CLContextCL::createProgramWithBinary(const cl::Program &program,
-                                                        const cl::Binaries &binaries,
+                                                        const size_t *lengths,
+                                                        const unsigned char **binaries,
                                                         cl_int *binaryStatus,
                                                         cl_int &errorCode)
 {
-    ASSERT(program.getDevices().size() == binaries.size());
     std::vector<cl_device_id> nativeDevices;
     for (const cl::DevicePtr &device : program.getDevices())
     {
         nativeDevices.emplace_back(device->getImpl<CLDeviceCL>().getNative());
     }
-    std::vector<size_t> lengths;
-    std::vector<const unsigned char *> nativeBinaries;
-    for (const cl::Binary &binary : binaries)
-    {
-        lengths.emplace_back(binary.size());
-        nativeBinaries.emplace_back(binary.data());
-    }
-    const cl_program nativeProgram = mNative->getDispatch().clCreateProgramWithBinary(
-        mNative, static_cast<cl_uint>(nativeDevices.size()), nativeDevices.data(), lengths.data(),
-        nativeBinaries.data(), binaryStatus, &errorCode);
+
+    cl_program nativeProgram = mNative->getDispatch().clCreateProgramWithBinary(
+        mNative, static_cast<cl_uint>(nativeDevices.size()), nativeDevices.data(), lengths,
+        binaries, binaryStatus, &errorCode);
+
     return CLProgramImpl::Ptr(nativeProgram != nullptr ? new CLProgramCL(program, nativeProgram)
                                                        : nullptr);
 }
@@ -268,6 +303,37 @@ CLProgramImpl::Ptr CLContextCL::createProgramWithBuiltInKernels(const cl::Progra
     const cl_program nativeProgram = mNative->getDispatch().clCreateProgramWithBuiltInKernels(
         mNative, static_cast<cl_uint>(nativeDevices.size()), nativeDevices.data(), kernel_names,
         &errorCode);
+    return CLProgramImpl::Ptr(nativeProgram != nullptr ? new CLProgramCL(program, nativeProgram)
+                                                       : nullptr);
+}
+
+CLProgramImpl::Ptr CLContextCL::linkProgram(const cl::Program &program,
+                                            const cl::DevicePtrs &devices,
+                                            const char *options,
+                                            const cl::ProgramPtrs &inputPrograms,
+                                            cl::Program *notify,
+                                            cl_int &errorCode)
+{
+    std::vector<cl_device_id> nativeDevices;
+    for (const cl::DevicePtr &device : devices)
+    {
+        nativeDevices.emplace_back(device->getImpl<CLDeviceCL>().getNative());
+    }
+    const cl_uint numDevices = static_cast<cl_uint>(nativeDevices.size());
+    const cl_device_id *const nativeDevicesPtr =
+        !nativeDevices.empty() ? nativeDevices.data() : nullptr;
+
+    std::vector<cl_program> nativePrograms;
+    for (const cl::ProgramPtr &program : inputPrograms)
+    {
+        nativePrograms.emplace_back(program->getImpl<CLProgramCL>().getNative());
+    }
+    const cl_uint numInputHeaders = static_cast<cl_uint>(nativePrograms.size());
+
+    const cl::ProgramCB callback   = notify != nullptr ? CLProgramCL::Callback : nullptr;
+    const cl_program nativeProgram = mNative->getDispatch().clLinkProgram(
+        mNative, numDevices, nativeDevicesPtr, options, numInputHeaders, nativePrograms.data(),
+        callback, notify, &errorCode);
     return CLProgramImpl::Ptr(nativeProgram != nullptr ? new CLProgramCL(program, nativeProgram)
                                                        : nullptr);
 }

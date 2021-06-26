@@ -15,16 +15,64 @@
 namespace cl
 {
 
+cl_int Program::build(cl_uint numDevices,
+                      const cl_device_id *deviceList,
+                      const char *options,
+                      ProgramCB pfnNotify,
+                      void *userData)
+{
+    DevicePtrs devices;
+    devices.reserve(numDevices);
+    while (numDevices-- != 0u)
+    {
+        devices.emplace_back(&(*deviceList++)->cast<Device>());
+    }
+    Program *notify = nullptr;
+    if (pfnNotify != nullptr)
+    {
+        // This program has to be retained until the notify callback is called.
+        retain();
+        *mCallback = CallbackData(pfnNotify, userData);
+        notify     = this;
+    }
+    return mImpl->build(devices, options, notify);
+}
+
+cl_int Program::compile(cl_uint numDevices,
+                        const cl_device_id *deviceList,
+                        const char *options,
+                        cl_uint numInputHeaders,
+                        const cl_program *inputHeaders,
+                        const char **headerIncludeNames,
+                        ProgramCB pfnNotify,
+                        void *userData)
+{
+    DevicePtrs devices;
+    devices.reserve(numDevices);
+    while (numDevices-- != 0u)
+    {
+        devices.emplace_back(&(*deviceList++)->cast<Device>());
+    }
+    ProgramPtrs programs;
+    programs.reserve(numInputHeaders);
+    while (numInputHeaders-- != 0u)
+    {
+        programs.emplace_back(&(*inputHeaders++)->cast<Program>());
+    }
+    Program *notify = nullptr;
+    if (pfnNotify != nullptr)
+    {
+        // This program has to be retained until the notify callback is called.
+        retain();
+        *mCallback = CallbackData(pfnNotify, userData);
+        notify     = this;
+    }
+    return mImpl->compile(devices, options, programs, headerIncludeNames, notify);
+}
+
 cl_int Program::getInfo(ProgramInfo name, size_t valueSize, void *value, size_t *valueSizeRet) const
 {
-    static_assert(std::is_same<cl_uint, cl_bool>::value &&
-                      std::is_same<cl_uint, cl_addressing_mode>::value &&
-                      std::is_same<cl_uint, cl_filter_mode>::value,
-                  "OpenCL type mismatch");
-
     std::vector<cl_device_id> devices;
-    std::vector<size_t> binarySizes;
-    std::vector<const unsigned char *> binaries;
     cl_uint valUInt       = 0u;
     void *valPointer      = nullptr;
     const void *copyValue = nullptr;
@@ -65,43 +113,12 @@ cl_int Program::getInfo(ProgramInfo name, size_t valueSize, void *value, size_t 
             copySize  = mIL.length() + 1u;
             break;
         case ProgramInfo::BinarySizes:
-            binarySizes.resize(mDevices.size(), 0u);
-            for (size_t index = 0u; index < binarySizes.size(); ++index)
-            {
-                binarySizes[index] = index < mBinaries.size() ? mBinaries[index].size() : 0u;
-            }
-            copyValue = binarySizes.data();
-            copySize  = binarySizes.size() * sizeof(decltype(binarySizes)::value_type);
-            break;
         case ProgramInfo::Binaries:
-            binaries.resize(mDevices.size(), nullptr);
-            for (size_t index = 0u; index < binaries.size(); ++index)
-            {
-                binaries[index] = index < mBinaries.size() && mBinaries[index].empty()
-                                      ? mBinaries[index].data()
-                                      : nullptr;
-            }
-            copyValue = binaries.data();
-            copySize  = binaries.size() * sizeof(decltype(binaries)::value_type);
-            break;
         case ProgramInfo::NumKernels:
-            copyValue = &mNumKernels;
-            copySize  = sizeof(mNumKernels);
-            break;
         case ProgramInfo::KernelNames:
-            copyValue = mKernelNames.c_str();
-            copySize  = mKernelNames.length() + 1u;
-            break;
         case ProgramInfo::ScopeGlobalCtorsPresent:
-            valUInt   = CL_FALSE;
-            copyValue = &valUInt;
-            copySize  = sizeof(valUInt);
-            break;
         case ProgramInfo::ScopeGlobalDtorsPresent:
-            valUInt   = CL_FALSE;
-            copyValue = &valUInt;
-            copySize  = sizeof(valUInt);
-            break;
+            return mImpl->getInfo(name, valueSize, value, valueSizeRet);
         default:
             return CL_INVALID_VALUE;
     }
@@ -124,6 +141,15 @@ cl_int Program::getInfo(ProgramInfo name, size_t valueSize, void *value, size_t 
         *valueSizeRet = copySize;
     }
     return CL_SUCCESS;
+}
+
+cl_int Program::getBuildInfo(cl_device_id device,
+                             ProgramBuildInfo name,
+                             size_t valueSize,
+                             void *value,
+                             size_t *valueSizeRet) const
+{
+    return mImpl->getBuildInfo(device->cast<Device>(), name, valueSize, value, valueSizeRet);
 }
 
 cl_kernel Program::createKernel(const char *kernel_name, cl_int &errorCode)
@@ -162,9 +188,25 @@ cl_int Program::createKernels(cl_uint numKernels, cl_kernel *kernels, cl_uint *n
 
 Program::~Program() = default;
 
+void Program::callback()
+{
+    CallbackData callbackData;
+    mCallback->swap(callbackData);
+    const ProgramCB callback = callbackData.first;
+    void *const userData     = callbackData.second;
+    ASSERT(callback != nullptr);
+    callback(this, userData);
+    // This program can be released after the callback was called.
+    if (release())
+    {
+        delete this;
+    }
+}
+
 Program::Program(Context &context, std::string &&source, cl_int &errorCode)
     : mContext(&context),
       mDevices(context.getDevices()),
+      mNumAttachedKernels(0u),
       mImpl(context.getImpl().createProgramWithSource(*this, source, errorCode)),
       mSource(std::move(source))
 {}
@@ -173,26 +215,52 @@ Program::Program(Context &context, const void *il, size_t length, cl_int &errorC
     : mContext(&context),
       mDevices(context.getDevices()),
       mIL(static_cast<const char *>(il), length),
+      mNumAttachedKernels(0u),
       mImpl(context.getImpl().createProgramWithIL(*this, il, length, errorCode)),
       mSource(mImpl ? mImpl->getSource(errorCode) : std::string{})
 {}
 
 Program::Program(Context &context,
                  DevicePtrs &&devices,
-                 Binaries &&binaries,
+                 const size_t *lengths,
+                 const unsigned char **binaries,
                  cl_int *binaryStatus,
                  cl_int &errorCode)
     : mContext(&context),
       mDevices(std::move(devices)),
-      mImpl(context.getImpl().createProgramWithBinary(*this, binaries, binaryStatus, errorCode)),
-      mSource(mImpl ? mImpl->getSource(errorCode) : std::string{}),
-      mBinaries(std::move(binaries))
+      mNumAttachedKernels(0u),
+      mImpl(context.getImpl()
+                .createProgramWithBinary(*this, lengths, binaries, binaryStatus, errorCode)),
+      mSource(mImpl ? mImpl->getSource(errorCode) : std::string{})
 {}
 
 Program::Program(Context &context, DevicePtrs &&devices, const char *kernelNames, cl_int &errorCode)
     : mContext(&context),
       mDevices(std::move(devices)),
+      mNumAttachedKernels(0u),
       mImpl(context.getImpl().createProgramWithBuiltInKernels(*this, kernelNames, errorCode)),
+      mSource(mImpl ? mImpl->getSource(errorCode) : std::string{})
+{}
+
+Program::Program(Context &context,
+                 const DevicePtrs &devices,
+                 const char *options,
+                 const cl::ProgramPtrs &inputPrograms,
+                 ProgramCB pfnNotify,
+                 void *userData,
+                 cl_int &errorCode)
+    : mContext(&context),
+      mDevices(!devices.empty() ? devices : context.getDevices()),
+      // This program has to be retained until the notify callback is called.
+      mCallback(pfnNotify != nullptr ? (retain(), CallbackData(pfnNotify, userData))
+                                     : CallbackData()),
+      mNumAttachedKernels(0u),
+      mImpl(context.getImpl().linkProgram(*this,
+                                          devices,
+                                          options,
+                                          inputPrograms,
+                                          pfnNotify != nullptr ? this : nullptr,
+                                          errorCode)),
       mSource(mImpl ? mImpl->getSource(errorCode) : std::string{})
 {}
 

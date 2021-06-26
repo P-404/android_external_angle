@@ -36,10 +36,17 @@ class CLContextImpl : angle::NonCopyable
                                            cl_int &errorCode) = 0;
 
     virtual CLMemoryImpl::Ptr createImage(const cl::Image &image,
+                                          cl::MemFlags flags,
                                           const cl_image_format &format,
                                           const cl::ImageDescriptor &desc,
                                           void *hostPtr,
                                           cl_int &errorCode) = 0;
+
+    virtual cl_int getSupportedImageFormats(cl::MemFlags flags,
+                                            cl::MemObjectType imageType,
+                                            cl_uint numEntries,
+                                            cl_image_format *imageFormats,
+                                            cl_uint *numImageFormats) = 0;
 
     virtual CLSamplerImpl::Ptr createSampler(const cl::Sampler &sampler, cl_int &errorCode) = 0;
 
@@ -53,13 +60,21 @@ class CLContextImpl : angle::NonCopyable
                                                    cl_int &errorCode) = 0;
 
     virtual CLProgramImpl::Ptr createProgramWithBinary(const cl::Program &program,
-                                                       const cl::Binaries &binaries,
+                                                       const size_t *lengths,
+                                                       const unsigned char **binaries,
                                                        cl_int *binaryStatus,
                                                        cl_int &errorCode) = 0;
 
     virtual CLProgramImpl::Ptr createProgramWithBuiltInKernels(const cl::Program &program,
                                                                const char *kernel_names,
                                                                cl_int &errorCode) = 0;
+
+    virtual CLProgramImpl::Ptr linkProgram(const cl::Program &program,
+                                           const cl::DevicePtrs &devices,
+                                           const char *options,
+                                           const cl::ProgramPtrs &inputPrograms,
+                                           cl::Program *notify,
+                                           cl_int &errorCode) = 0;
 
     virtual CLEventImpl::Ptr createUserEvent(const cl::Event &event, cl_int &errorCode) = 0;
 

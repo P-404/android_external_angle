@@ -15,6 +15,40 @@
 namespace cl
 {
 
+namespace
+{
+
+MemFlags InheritMemFlags(MemFlags flags, Memory *parent)
+{
+    if (parent != nullptr)
+    {
+        const MemFlags parentFlags = parent->getFlags();
+        const MemFlags access(CL_MEM_READ_WRITE | CL_MEM_READ_ONLY | CL_MEM_WRITE_ONLY);
+        const MemFlags hostAccess(CL_MEM_HOST_WRITE_ONLY | CL_MEM_HOST_READ_ONLY |
+                                  CL_MEM_HOST_NO_ACCESS);
+        const MemFlags hostPtrFlags(CL_MEM_USE_HOST_PTR | CL_MEM_ALLOC_HOST_PTR |
+                                    CL_MEM_COPY_HOST_PTR);
+        if (flags.isNotSet(access))
+        {
+            flags.set(parentFlags.mask(access));
+        }
+        if (flags.isNotSet(hostAccess))
+        {
+            flags.set(parentFlags.mask(hostAccess));
+        }
+        flags.set(parentFlags.mask(hostPtrFlags));
+    }
+    return flags;
+}
+
+}  // namespace
+
+cl_int Memory::setDestructorCallback(MemoryCB pfnNotify, void *userData)
+{
+    mDestructorCallbacks->emplace(pfnNotify, userData);
+    return CL_SUCCESS;
+}
+
 cl_int Memory::getInfo(MemInfo name, size_t valueSize, void *value, size_t *valueSizeRet) const
 {
     static_assert(
@@ -29,7 +63,7 @@ cl_int Memory::getInfo(MemInfo name, size_t valueSize, void *value, size_t *valu
     switch (name)
     {
         case MemInfo::Type:
-            valUInt   = getType();
+            valUInt   = ToCLenum(getType());
             copyValue = &valUInt;
             copySize  = sizeof(valUInt);
             break;
@@ -46,8 +80,9 @@ cl_int Memory::getInfo(MemInfo name, size_t valueSize, void *value, size_t *valu
             copySize  = sizeof(mHostPtr);
             break;
         case MemInfo::MapCount:
-            copyValue = &mMapCount;
-            copySize  = sizeof(mMapCount);
+            valUInt   = mMapCount;
+            copyValue = &valUInt;
+            copySize  = sizeof(valUInt);
             break;
         case MemInfo::ReferenceCount:
             valUInt   = getRefCount();
@@ -101,30 +136,17 @@ cl_int Memory::getInfo(MemInfo name, size_t valueSize, void *value, size_t *valu
     return CL_SUCCESS;
 }
 
-Memory::~Memory() = default;
-
-MemFlags Memory::getEffectiveFlags() const
+Memory::~Memory()
 {
-    MemFlags flags = mFlags;
-    if (mParent)
+    std::stack<CallbackData> callbacks;
+    mDestructorCallbacks->swap(callbacks);
+    while (!callbacks.empty())
     {
-        const MemFlags parent = mParent->getFlags();
-        const MemFlags access(CL_MEM_READ_WRITE | CL_MEM_READ_ONLY | CL_MEM_WRITE_ONLY);
-        const MemFlags hostAccess(CL_MEM_HOST_WRITE_ONLY | CL_MEM_HOST_READ_ONLY |
-                                  CL_MEM_HOST_NO_ACCESS);
-        const MemFlags hostPtrFlags(CL_MEM_USE_HOST_PTR | CL_MEM_ALLOC_HOST_PTR |
-                                    CL_MEM_COPY_HOST_PTR);
-        if (flags.isNotSet(access))
-        {
-            flags.set(parent.mask(access));
-        }
-        if (flags.isNotSet(hostAccess))
-        {
-            flags.set(parent.mask(hostAccess));
-        }
-        flags.set(parent.mask(hostPtrFlags));
+        const MemoryCB callback = callbacks.top().first;
+        void *const userData    = callbacks.top().second;
+        callbacks.pop();
+        callback(this, userData);
     }
-    return flags;
 }
 
 Memory::Memory(const Buffer &buffer,
@@ -139,7 +161,8 @@ Memory::Memory(const Buffer &buffer,
       mFlags(flags),
       mHostPtr(flags.isSet(CL_MEM_USE_HOST_PTR) ? hostPtr : nullptr),
       mImpl(context.getImpl().createBuffer(buffer, size, hostPtr, errorCode)),
-      mSize(size)
+      mSize(size),
+      mMapCount(0u)
 {}
 
 Memory::Memory(const Buffer &buffer,
@@ -149,13 +172,14 @@ Memory::Memory(const Buffer &buffer,
                size_t size,
                cl_int &errorCode)
     : mContext(parent.mContext),
-      mFlags(flags),
+      mFlags(InheritMemFlags(flags, &parent)),
       mHostPtr(parent.mHostPtr != nullptr ? static_cast<char *>(parent.mHostPtr) + offset
                                           : nullptr),
       mParent(&parent),
       mOffset(offset),
-      mImpl(parent.mImpl->createSubBuffer(buffer, size, errorCode)),
-      mSize(size)
+      mImpl(parent.mImpl->createSubBuffer(buffer, flags, size, errorCode)),
+      mSize(size),
+      mMapCount(0u)
 {}
 
 Memory::Memory(const Image &image,
@@ -169,11 +193,12 @@ Memory::Memory(const Image &image,
                cl_int &errorCode)
     : mContext(&context),
       mProperties(std::move(properties)),
-      mFlags(flags),
+      mFlags(InheritMemFlags(flags, parent)),
       mHostPtr(flags.isSet(CL_MEM_USE_HOST_PTR) ? hostPtr : nullptr),
       mParent(parent),
-      mImpl(context.getImpl().createImage(image, format, desc, hostPtr, errorCode)),
-      mSize(mImpl ? mImpl->getSize(errorCode) : 0u)
+      mImpl(context.getImpl().createImage(image, flags, format, desc, hostPtr, errorCode)),
+      mSize(mImpl ? mImpl->getSize(errorCode) : 0u),
+      mMapCount(0u)
 {}
 
 }  // namespace cl
