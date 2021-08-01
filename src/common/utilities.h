@@ -37,7 +37,6 @@ size_t VariableInternalSize(GLenum type);
 size_t VariableExternalSize(GLenum type);
 int VariableRowCount(GLenum type);
 int VariableColumnCount(GLenum type);
-int VariableAttributeCount(GLenum type);
 bool IsSamplerType(GLenum type);
 bool IsSamplerCubeType(GLenum type);
 bool IsSamplerYUVType(GLenum type);
@@ -116,6 +115,11 @@ bool IsIntegerFormat(GLenum unsizedFormat);
 // Returns the product of the sizes in the vector, or 1 if the vector is empty. Doesn't currently
 // perform overflow checks.
 unsigned int ArraySizeProduct(const std::vector<unsigned int> &arraySizes);
+// Returns the product of the sizes in the vector except for the outermost dimension, or 1 if the
+// vector is empty.
+unsigned int InnerArraySizeProduct(const std::vector<unsigned int> &arraySizes);
+// Returns the outermost array dimension, or 1 if the vector is empty.
+unsigned int OutermostArraySize(const std::vector<unsigned int> &arraySizes);
 
 // Return the array index at the end of name, and write the length of name before the final array
 // index into nameLengthWithoutArrayIndexOut. In case name doesn't include an array index, return

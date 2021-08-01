@@ -363,10 +363,7 @@ ANGLE_NO_DISCARD bool AddBresenhamEmulationVS(TCompiler *compiler,
         new TIntermIfElse(specConst->getLineRasterEmulation(), emulationBlock, nullptr);
 
     // Ensure the statements run at the end of the main() function.
-    TIntermFunctionDefinition *main = FindMain(root);
-    TIntermBlock *mainBody          = main->getBody();
-    mainBody->appendStatement(ifEmulation);
-    return compiler->validateAST(root);
+    return RunAtTheEndOfShader(compiler, root, ifEmulation, symbolTable);
 }
 
 ANGLE_NO_DISCARD bool AddXfbEmulationSupport(TCompiler *compiler,
@@ -390,7 +387,7 @@ ANGLE_NO_DISCARD bool AddXfbEmulationSupport(TCompiler *compiler,
 
     const TType *ivec4Type = StaticType::GetBasic<EbtInt, kMaxXfbBuffers>();
     TType *stridesType     = new TType(*ivec4Type);
-    stridesType->setQualifier(EvqConst);
+    stridesType->setQualifier(EvqParamConst);
 
     // Create the parameter variable.
     TVariable *stridesVar = new TVariable(symbolTable, ImmutableString("strides"), stridesType,
@@ -531,7 +528,10 @@ ANGLE_NO_DISCARD bool AddXfbEmulationSupport(TCompiler *compiler,
         varName << vk::kXfbEmulationBufferName;
         varName.appendDecimal(bufferIndex);
 
-        DeclareInterfaceBlock(root, symbolTable, fieldList, EvqBuffer, TLayoutQualifier::Create(),
+        TLayoutQualifier layoutQualifier = TLayoutQualifier::Create();
+        layoutQualifier.blockStorage     = EbsStd430;
+
+        DeclareInterfaceBlock(root, symbolTable, fieldList, EvqBuffer, layoutQualifier,
                               TMemoryQualifier::Create(), 0, blockName, varName);
     }
 
@@ -784,6 +784,8 @@ bool TranslatorVulkan::translateImpl(TInfoSinkBase &sink,
     }
 
     sink << "#version 450 core\n";
+    writeExtensionBehavior(compileOptions, sink);
+    WritePragma(sink, compileOptions, getPragma());
 
     // Write out default uniforms into a uniform block assigned to a specific set/binding.
     int defaultUniformCount           = 0;
@@ -1064,7 +1066,6 @@ bool TranslatorVulkan::translateImpl(TInfoSinkBase &sink,
             }
 
             // Emulate gl_FragColor and gl_FragData with normal output variables.
-            mValidateASTOptions.validateVariableReferences = false;
             if (!EmulateFragColorData(this, root, &getSymbolTable()))
             {
                 return false;
@@ -1264,7 +1265,50 @@ bool TranslatorVulkan::translateImpl(TInfoSinkBase &sink,
         return false;
     }
 
+    // Make sure function call validation is not accidentally left off anywhere.
+    ASSERT(mValidateASTOptions.validateFunctionCall);
+    ASSERT(mValidateASTOptions.validateNoRawFunctionCalls);
+
     return true;
+}
+
+void TranslatorVulkan::writeExtensionBehavior(ShCompileOptions compileOptions, TInfoSinkBase &sink)
+{
+    const TExtensionBehavior &extBehavior = getExtensionBehavior();
+    TBehavior multiviewBehavior           = EBhUndefined;
+    TBehavior multiview2Behavior          = EBhUndefined;
+    for (const auto &iter : extBehavior)
+    {
+        if (iter.second == EBhUndefined || iter.second == EBhDisable)
+        {
+            continue;
+        }
+
+        switch (iter.first)
+        {
+            case TExtension::OVR_multiview:
+                multiviewBehavior = iter.second;
+                break;
+            case TExtension::OVR_multiview2:
+                multiviewBehavior = iter.second;
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (multiviewBehavior != EBhUndefined || multiview2Behavior != EBhUndefined)
+    {
+        // Only either OVR_multiview or OVR_multiview2 should be emitted.
+        TExtension ext     = TExtension::OVR_multiview;
+        TBehavior behavior = multiviewBehavior;
+        if (multiview2Behavior != EBhUndefined)
+        {
+            ext      = TExtension::OVR_multiview2;
+            behavior = multiview2Behavior;
+        }
+        EmitMultiviewGLSL(*this, compileOptions, ext, behavior, sink);
+    }
 }
 
 bool TranslatorVulkan::translate(TIntermBlock *root,
@@ -1283,7 +1327,7 @@ bool TranslatorVulkan::translate(TIntermBlock *root,
 
     if ((compileOptions & SH_USE_SPECIALIZATION_CONSTANT) != 0)
     {
-        DriverUniform driverUniforms;
+        DriverUniform driverUniforms(DriverUniformMode::InterfaceBlock);
         if (!translateImpl(sink, root, compileOptions, perfDiagnostics, &specConst,
                            &driverUniforms))
         {
@@ -1292,7 +1336,7 @@ bool TranslatorVulkan::translate(TIntermBlock *root,
     }
     else
     {
-        DriverUniformExtended driverUniformsExt;
+        DriverUniformExtended driverUniformsExt(DriverUniformMode::InterfaceBlock);
         if (!translateImpl(sink, root, compileOptions, perfDiagnostics, &specConst,
                            &driverUniformsExt))
         {
@@ -1301,11 +1345,7 @@ bool TranslatorVulkan::translate(TIntermBlock *root,
     }
 
 #if defined(ANGLE_ENABLE_DIRECT_SPIRV_GENERATION)
-    constexpr ShCompileOptions kUnsupportedTransformations = SH_CLAMP_POINT_SIZE;
-    if ((compileOptions & SH_GENERATE_SPIRV_DIRECTLY) != 0 &&
-        ((getShaderType() == GL_VERTEX_SHADER &&
-          (compileOptions & kUnsupportedTransformations) == 0) ||
-         getShaderType() == GL_COMPUTE_SHADER))
+    if ((compileOptions & SH_GENERATE_SPIRV_DIRECTLY) != 0)
     {
         // Declare the implicitly defined gl_PerVertex I/O blocks if not already.  This will help
         // SPIR-V generation treat them mostly like usual I/O blocks.

@@ -964,8 +964,8 @@ bool ValidateES2TexImageParametersBase(const Context *context,
         return false;
     }
 
-    if (xoffset < 0 || std::numeric_limits<GLsizei>::max() - xoffset < width ||
-        std::numeric_limits<GLsizei>::max() - yoffset < height)
+    if ((xoffset < 0 || std::numeric_limits<GLsizei>::max() - xoffset < width) ||
+        (yoffset < 0 || std::numeric_limits<GLsizei>::max() - yoffset < height))
     {
         context->validationError(GL_INVALID_VALUE, kResourceMaxTextureSize);
         return false;
@@ -1319,12 +1319,8 @@ bool ValidateES2TexImageParametersBase(const Context *context,
                     context->validationError(GL_INVALID_OPERATION, kInvalidFormat);
                     return false;
                 }
-                else
-                {
-                    context->validationError(GL_INVALID_ENUM, kEnumNotSupported);
-                    return false;
-                }
-                break;
+                context->validationError(GL_INVALID_ENUM, kEnumNotSupported);
+                return false;
             case GL_COMPRESSED_RGBA_S3TC_DXT3_ANGLE:
                 if (context->getExtensions().textureCompressionDXT3)
                 {

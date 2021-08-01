@@ -592,7 +592,7 @@ void ContextVk::onDestroy(const gl::Context *context)
     outputCumulativePerfCounters();
 
     // Remove context from the share group
-    mShareGroupVk->getShareContextSet()->erase(this);
+    mShareGroupVk->getContexts()->erase(this);
 
     // This will not destroy any resources. It will release them to be collected after finish.
     mIncompleteTextures.onDestroy(context);
@@ -678,7 +678,16 @@ angle::Result ContextVk::initialize()
             vk::kDefaultTransformFeedbackQueryPoolSize));
     }
 
-    // Init gles to vulkan index type map
+    // The primitives generated query is provided through the Vulkan pipeline statistics query if
+    // supported.  TODO: If VK_EXT_primitives_generated_query is supported, use that instead.
+    // http://anglebug.com/5430
+    if (getFeatures().supportsPipelineStatisticsQuery.enabled)
+    {
+        ANGLE_TRY(mQueryPools[gl::QueryType::PrimitivesGenerated].init(
+            this, VK_QUERY_TYPE_PIPELINE_STATISTICS, vk::kDefaultPrimitivesGeneratedQueryPoolSize));
+    }
+
+    // Init GLES to Vulkan index type map.
     initIndexTypeMap();
 
     // Init driver uniforms and get the descriptor set layouts.
@@ -793,7 +802,7 @@ angle::Result ContextVk::initialize()
                         kStagingBufferSize, true, vk::DynamicBufferPolicy::SporadicTextureUpload);
 
     // Add context into the share group
-    mShareGroupVk->getShareContextSet()->insert(this);
+    mShareGroupVk->getContexts()->insert(this);
 
     return angle::Result::Continue;
 }
@@ -1954,7 +1963,7 @@ angle::Result ContextVk::handleDirtyGraphicsTransformFeedbackBuffersExtension(
         transformFeedbackVk->getBufferSizes();
 
     mRenderPassCommandBuffer->bindTransformFeedbackBuffers(
-        static_cast<uint32_t>(bufferCount), bufferHandles.data(), bufferOffsets.data(),
+        0, static_cast<uint32_t>(bufferCount), bufferHandles.data(), bufferOffsets.data(),
         bufferSizes.data());
 
     if (!mState.isTransformFeedbackActiveUnpaused())
@@ -1997,11 +2006,29 @@ angle::Result ContextVk::handleDirtyGraphicsViewport(DirtyBits::Iterator *dirtyB
     mRenderPassCommandBuffer->setViewport(0, 1, &mViewport);
     return angle::Result::Continue;
 }
+
 angle::Result ContextVk::handleDirtyGraphicsScissor(DirtyBits::Iterator *dirtyBitsIterator,
                                                     DirtyBits dirtyBitMask)
 {
-    mRenderPassCommandBuffer->setScissor(0, 1, &mScissor);
+    handleDirtyGraphicsScissorImpl(mState.isQueryActive(gl::QueryType::PrimitivesGenerated));
     return angle::Result::Continue;
+}
+
+void ContextVk::handleDirtyGraphicsScissorImpl(bool isPrimitivesGeneratedQueryActive)
+{
+    // If primitives generated query and rasterizer discard are both active, but the Vulkan
+    // implementation of the query does not support rasterizer discard, use an empty scissor to
+    // emulate it.
+    if (isEmulatingRasterizerDiscardDuringPrimitivesGeneratedQuery(
+            isPrimitivesGeneratedQueryActive))
+    {
+        VkRect2D emptyScissor = {};
+        mRenderPassCommandBuffer->setScissor(0, 1, &emptyScissor);
+    }
+    else
+    {
+        mRenderPassCommandBuffer->setScissor(0, 1, &mScissor);
+    }
 }
 
 angle::Result ContextVk::handleDirtyComputeDescriptorSets()
@@ -2148,10 +2175,10 @@ angle::Result ContextVk::submitFrame(const vk::Semaphore *signalSemaphore)
     }
 
     getShareGroupVk()->acquireResourceUseList(std::move(mResourceUseList));
-    ANGLE_TRY(mRenderer->submitFrame(this, mContextPriority, std::move(mWaitSemaphores),
-                                     std::move(mWaitSemaphoreStageMasks), signalSemaphore,
-                                     getShareGroupVk()->releaseResourceUseLists(),
-                                     std::move(mCurrentGarbage), &mCommandPool));
+    ANGLE_TRY(mRenderer->submitFrame(
+        this, hasProtectedContent(), mContextPriority, std::move(mWaitSemaphores),
+        std::move(mWaitSemaphoreStageMasks), signalSemaphore,
+        getShareGroupVk()->releaseResourceUseLists(), std::move(mCurrentGarbage), &mCommandPool));
 
     onRenderPassFinished();
     mComputeDirtyBits |= mNewComputeCommandBufferDirtyBits;
@@ -2243,7 +2270,7 @@ angle::Result ContextVk::synchronizeCpuGpuTime()
 
     // Create a query used to receive the GPU timestamp
     vk::QueryHelper timestampQuery;
-    ANGLE_TRY(mGpuEventQueryPool.allocateQuery(this, &timestampQuery));
+    ANGLE_TRY(mGpuEventQueryPool.allocateQuery(this, &timestampQuery, 1));
 
     // Create the three events
     VkEventCreateInfo eventCreateInfo = {};
@@ -2275,7 +2302,7 @@ angle::Result ContextVk::synchronizeCpuGpuTime()
 
         vk::ResourceUseList scratchResourceUseList;
 
-        ANGLE_TRY(mRenderer->getCommandBufferOneOff(this, &commandBuffer));
+        ANGLE_TRY(mRenderer->getCommandBufferOneOff(this, hasProtectedContent(), &commandBuffer));
 
         commandBuffer.setEvent(gpuReady.get().getHandle(), VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT);
         commandBuffer.waitEvents(1, cpuReady.get().ptr(), VK_PIPELINE_STAGE_HOST_BIT,
@@ -2291,9 +2318,9 @@ angle::Result ContextVk::synchronizeCpuGpuTime()
         Serial throwAwaySerial;
         // vkEvent's are externally synchronized, therefore need work to be submitted before calling
         // vkGetEventStatus
-        ANGLE_TRY(mRenderer->queueSubmitOneOff(this, std::move(commandBuffer), mContextPriority,
-                                               nullptr, vk::SubmitPolicy::EnsureSubmitted,
-                                               &throwAwaySerial));
+        ANGLE_TRY(mRenderer->queueSubmitOneOff(
+            this, std::move(commandBuffer), hasProtectedContent(), mContextPriority, nullptr,
+            vk::SubmitPolicy::EnsureSubmitted, &throwAwaySerial));
         scratchResourceUseList.releaseResourceUsesAndUpdateSerials(throwAwaySerial);
 
         // Wait for GPU to be ready.  This is a short busy wait.
@@ -2375,7 +2402,7 @@ angle::Result ContextVk::traceGpuEventImpl(vk::CommandBuffer *commandBuffer,
     GpuEventQuery gpuEvent;
     gpuEvent.name  = name;
     gpuEvent.phase = phase;
-    ANGLE_TRY(mGpuEventQueryPool.allocateQuery(this, &gpuEvent.queryHelper));
+    ANGLE_TRY(mGpuEventQueryPool.allocateQuery(this, &gpuEvent.queryHelper, 1));
 
     gpuEvent.queryHelper.writeTimestamp(this, commandBuffer);
 
@@ -3303,6 +3330,23 @@ void ContextVk::updateScissor(const gl::State &glState)
     }
 }
 
+void ContextVk::updateDepthStencil(const gl::State &glState)
+{
+    const gl::DepthStencilState depthStencilState = glState.getDepthStencilState();
+
+    gl::Framebuffer *drawFramebuffer = mState.getDrawFramebuffer();
+    mGraphicsPipelineDesc->updateDepthTestEnabled(&mGraphicsPipelineTransition, depthStencilState,
+                                                  drawFramebuffer);
+    mGraphicsPipelineDesc->updateDepthWriteEnabled(&mGraphicsPipelineTransition, depthStencilState,
+                                                   drawFramebuffer);
+    mGraphicsPipelineDesc->updateStencilTestEnabled(&mGraphicsPipelineTransition, depthStencilState,
+                                                    drawFramebuffer);
+    mGraphicsPipelineDesc->updateStencilFrontWriteMask(&mGraphicsPipelineTransition,
+                                                       depthStencilState, drawFramebuffer);
+    mGraphicsPipelineDesc->updateStencilBackWriteMask(&mGraphicsPipelineTransition,
+                                                      depthStencilState, drawFramebuffer);
+}
+
 // If the target is a single-sampled target, sampleShading should be disabled, to use Bresenham line
 // raterization feature.
 void ContextVk::updateSampleShadingWithRasterizationSamples(const uint32_t rasterizationSamples)
@@ -3322,6 +3366,39 @@ void ContextVk::updateRasterizationSamples(const uint32_t rasterizationSamples)
                                                       rasterizationSamples);
     updateSampleShadingWithRasterizationSamples(rasterizationSamples);
     updateSampleMaskWithRasterizationSamples(rasterizationSamples);
+}
+
+void ContextVk::updateRasterizerDiscardEnabled(bool isPrimitivesGeneratedQueryActive)
+{
+    // On some devices, when rasterizerDiscardEnable is enabled, the
+    // VK_EXT_primitives_generated_query as well as the pipeline statistics query used to emulate it
+    // are non-functional.  For VK_EXT_primitives_generated_query there's a feature bit but not for
+    // pipeline statistics query.  If the primitives generated query is active (and rasterizer
+    // discard is not supported), rasterizerDiscardEnable is set to false and the functionality
+    // is otherwise emulated (by using an empty scissor).
+
+    // If the primitives generated query implementation supports rasterizer discard, just set
+    // rasterizer discard as requested.  Otherwise disable it.
+    bool isRasterizerDiscardEnabled   = mState.isRasterizerDiscardEnabled();
+    bool isEmulatingRasterizerDiscard = isEmulatingRasterizerDiscardDuringPrimitivesGeneratedQuery(
+        isPrimitivesGeneratedQueryActive);
+
+    mGraphicsPipelineDesc->updateRasterizerDiscardEnabled(
+        &mGraphicsPipelineTransition, isRasterizerDiscardEnabled && !isEmulatingRasterizerDiscard);
+
+    invalidateCurrentGraphicsPipeline();
+
+    if (!isEmulatingRasterizerDiscard)
+    {
+        return;
+    }
+
+    // If we are emulating rasterizer discard, update the scissor if in render pass.  If not in
+    // render pass, DIRTY_BIT_SCISSOR will be set when the render pass next starts.
+    if (hasStartedRenderPass())
+    {
+        handleDirtyGraphicsScissorImpl(isPrimitivesGeneratedQueryActive);
+    }
 }
 
 void ContextVk::invalidateProgramBindingHelper(const gl::State &glState)
@@ -3543,8 +3620,8 @@ angle::Result ContextVk::syncState(const gl::Context *context,
                                                            glState.getRasterizerState());
                 break;
             case gl::State::DIRTY_BIT_RASTERIZER_DISCARD_ENABLED:
-                mGraphicsPipelineDesc->updateRasterizerDiscardEnabled(
-                    &mGraphicsPipelineTransition, glState.isRasterizerDiscardEnabled());
+                updateRasterizerDiscardEnabled(
+                    mState.isQueryActive(gl::QueryType::PrimitivesGenerated));
                 break;
             case gl::State::DIRTY_BIT_LINE_WIDTH:
                 mGraphicsPipelineDesc->updateLineWidth(&mGraphicsPipelineTransition,
@@ -3613,22 +3690,14 @@ angle::Result ContextVk::syncState(const gl::Context *context,
                                glState.getFarPlane());
                 updateColorMasks(glState.getBlendStateExt());
                 updateRasterizationSamples(mDrawFramebuffer->getSamples());
+                updateRasterizerDiscardEnabled(
+                    mState.isQueryActive(gl::QueryType::PrimitivesGenerated));
 
                 mGraphicsPipelineDesc->updateFrontFace(&mGraphicsPipelineTransition,
                                                        glState.getRasterizerState(),
                                                        isYFlipEnabledForDrawFBO());
                 updateScissor(glState);
-                const gl::DepthStencilState depthStencilState = glState.getDepthStencilState();
-                mGraphicsPipelineDesc->updateDepthTestEnabled(&mGraphicsPipelineTransition,
-                                                              depthStencilState, drawFramebuffer);
-                mGraphicsPipelineDesc->updateDepthWriteEnabled(&mGraphicsPipelineTransition,
-                                                               depthStencilState, drawFramebuffer);
-                mGraphicsPipelineDesc->updateStencilTestEnabled(&mGraphicsPipelineTransition,
-                                                                depthStencilState, drawFramebuffer);
-                mGraphicsPipelineDesc->updateStencilFrontWriteMask(
-                    &mGraphicsPipelineTransition, depthStencilState, drawFramebuffer);
-                mGraphicsPipelineDesc->updateStencilBackWriteMask(
-                    &mGraphicsPipelineTransition, depthStencilState, drawFramebuffer);
+                updateDepthStencil(glState);
                 mGraphicsPipelineDesc->resetSubpass(&mGraphicsPipelineTransition);
                 onDrawFramebufferRenderPassDescChange(mDrawFramebuffer, nullptr);
                 break;
@@ -4202,6 +4271,9 @@ angle::Result ContextVk::onFramebufferChange(FramebufferVk *framebufferVk)
     // Update scissor.
     updateScissor(mState);
 
+    // Update depth and stencil.
+    updateDepthStencil(mState);
+
     if (mState.getProgramExecutable())
     {
         ANGLE_TRY(invalidateCurrentShaderResources());
@@ -4544,9 +4616,17 @@ vk::DynamicQueryPool *ContextVk::getQueryPool(gl::QueryType queryType)
            queryType == gl::QueryType::TransformFeedbackPrimitivesWritten ||
            queryType == gl::QueryType::Timestamp || queryType == gl::QueryType::TimeElapsed);
 
-    // For PrimitivesGenerated queries, use the same pool as TransformFeedbackPrimitivesWritten.
-    // They are served with the same Vulkan query.
-    if (queryType == gl::QueryType::PrimitivesGenerated)
+    // For PrimitivesGenerated queries:
+    //
+    // - If VK_EXT_primitives_generated_query is supported, use that.
+    //   TODO: http://anglebug.com/5430
+    // - Otherwise, if pipelineStatisticsQuery is supported, use that,
+    // - Otherwise, use the same pool as TransformFeedbackPrimitivesWritten and share the query as
+    //   the Vulkan transform feedback query produces both results.  This option is non-conformant
+    //   as the primitives generated query will not be functional without transform feedback.
+    //
+    if (queryType == gl::QueryType::PrimitivesGenerated &&
+        !getFeatures().supportsPipelineStatisticsQuery.enabled)
     {
         queryType = gl::QueryType::TransformFeedbackPrimitivesWritten;
     }
@@ -4925,7 +5005,9 @@ angle::Result ContextVk::updateActiveTextures(const gl::Context *context)
     const gl::ActiveTextureMask &activeTextures    = executable->getActiveSamplersMask();
     const gl::ActiveTextureTypeArray &textureTypes = executable->getActiveSamplerTypes();
 
-    bool recreatePipelineLayout = false;
+    bool recreatePipelineLayout                     = false;
+    FormatIndexMap<uint64_t> externalFormatIndexMap = {};
+    FormatIndexMap<VkFormat> vkFormatIndexMap       = {};
     for (size_t textureUnit : activeTextures)
     {
         gl::Texture *texture        = textures[textureUnit];
@@ -5003,8 +5085,28 @@ angle::Result ContextVk::updateActiveTextures(const gl::Context *context)
             textureVk->getImageViewSubresourceSerial(samplerState);
         mActiveTexturesDesc.update(textureUnit, imageViewSerial, samplerHelper.getSamplerSerial());
 
+        if (textureVk->getImage().hasImmutableSampler())
+        {
+            uint64_t externalFormat = textureVk->getImage().getExternalFormat();
+            VkFormat vkFormat       = textureVk->getImage().getFormat().actualImageVkFormat();
+            if (externalFormat != 0)
+            {
+                externalFormatIndexMap[externalFormat] = static_cast<uint32_t>(textureUnit);
+            }
+            else
+            {
+                ASSERT(vkFormat != 0);
+                vkFormatIndexMap[vkFormat] = static_cast<uint32_t>(textureUnit);
+            }
+        }
+
         recreatePipelineLayout =
             textureVk->getAndResetImmutableSamplerDirtyState() || recreatePipelineLayout;
+    }
+
+    if (!mExecutable->isImmutableSamplerFormatCompatible(externalFormatIndexMap, vkFormatIndexMap))
+    {
+        recreatePipelineLayout = true;
     }
 
     // Recreate the pipeline layout, if necessary.
@@ -5212,7 +5314,7 @@ angle::Result ContextVk::finishImpl()
     ANGLE_TRACE_EVENT0("gpu.angle", "ContextVk::finishImpl");
 
     ANGLE_TRY(flushImpl(nullptr));
-    ANGLE_TRY(mRenderer->finish(this));
+    ANGLE_TRY(mRenderer->finish(this, hasProtectedContent()));
 
     clearAllGarbage();
 
@@ -5304,7 +5406,7 @@ angle::Result ContextVk::getTimestamp(uint64_t *timestampOut)
     vk::DeviceScoped<vk::DynamicQueryPool> timestampQueryPool(device);
     vk::QueryHelper timestampQuery;
     ANGLE_TRY(timestampQueryPool.get().init(this, VK_QUERY_TYPE_TIMESTAMP, 1));
-    ANGLE_TRY(timestampQueryPool.get().allocateQuery(this, &timestampQuery));
+    ANGLE_TRY(timestampQueryPool.get().allocateQuery(this, &timestampQuery, 1));
 
     vk::ResourceUseList scratchResourceUseList;
 
@@ -5312,7 +5414,7 @@ angle::Result ContextVk::getTimestamp(uint64_t *timestampOut)
     vk::DeviceScoped<vk::PrimaryCommandBuffer> commandBatch(device);
     vk::PrimaryCommandBuffer &commandBuffer = commandBatch.get();
 
-    ANGLE_TRY(mRenderer->getCommandBufferOneOff(this, &commandBuffer));
+    ANGLE_TRY(mRenderer->getCommandBufferOneOff(this, hasProtectedContent(), &commandBuffer));
 
     timestampQuery.writeTimestampToPrimary(this, &commandBuffer);
     timestampQuery.retain(&scratchResourceUseList);
@@ -5326,21 +5428,10 @@ angle::Result ContextVk::getTimestamp(uint64_t *timestampOut)
     vk::DeviceScoped<vk::Fence> fence(device);
     ANGLE_VK_TRY(this, fence.get().init(device, fenceInfo));
 
-    // Submit the command buffer
-    VkSubmitInfo submitInfo         = {};
-    submitInfo.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.waitSemaphoreCount   = 0;
-    submitInfo.pWaitSemaphores      = nullptr;
-    submitInfo.pWaitDstStageMask    = nullptr;
-    submitInfo.commandBufferCount   = 1;
-    submitInfo.pCommandBuffers      = commandBuffer.ptr();
-    submitInfo.signalSemaphoreCount = 0;
-    submitInfo.pSignalSemaphores    = nullptr;
-
     Serial throwAwaySerial;
-    ANGLE_TRY(mRenderer->queueSubmitOneOff(this, std::move(commandBuffer), mContextPriority,
-                                           &fence.get(), vk::SubmitPolicy::EnsureSubmitted,
-                                           &throwAwaySerial));
+    ANGLE_TRY(mRenderer->queueSubmitOneOff(this, std::move(commandBuffer), hasProtectedContent(),
+                                           mContextPriority, &fence.get(),
+                                           vk::SubmitPolicy::EnsureSubmitted, &throwAwaySerial));
 
     // Wait for the submission to finish.  Given no semaphores, there is hope that it would execute
     // in parallel with what's already running on the GPU.
@@ -5528,6 +5619,12 @@ uint32_t ContextVk::getCurrentSubpassIndex() const
     return mGraphicsPipelineDesc->getSubpass();
 }
 
+uint32_t ContextVk::getCurrentViewCount() const
+{
+    ASSERT(mDrawFramebuffer);
+    return mDrawFramebuffer->getRenderPassDesc().viewCount();
+}
+
 angle::Result ContextVk::flushCommandsAndEndRenderPassImpl()
 {
     // Ensure we flush the RenderPass *after* the prior commands.
@@ -5580,7 +5677,8 @@ angle::Result ContextVk::flushCommandsAndEndRenderPassImpl()
     ANGLE_TRY(getRenderPassWithOps(mRenderPassCommands->getRenderPassDesc(),
                                    mRenderPassCommands->getAttachmentOps(), &renderPass));
 
-    ANGLE_TRY(mRenderer->flushRenderPassCommands(this, *renderPass, &mRenderPassCommands));
+    ANGLE_TRY(mRenderer->flushRenderPassCommands(this, hasProtectedContent(), *renderPass,
+                                                 &mRenderPassCommands));
 
     if (mGpuEventsEnabled)
     {
@@ -5728,7 +5826,8 @@ angle::Result ContextVk::flushOutsideRenderPassCommands()
         mOutsideRenderPassCommands->addCommandDiagnostics(this);
     }
 
-    ANGLE_TRY(mRenderer->flushOutsideRPCommands(this, &mOutsideRenderPassCommands));
+    ANGLE_TRY(mRenderer->flushOutsideRPCommands(this, hasProtectedContent(),
+                                                &mOutsideRenderPassCommands));
 
     // Make sure appropriate dirty bits are set, in case another thread makes a submission before
     // the next dispatch call.
@@ -5748,6 +5847,12 @@ angle::Result ContextVk::beginRenderPassQuery(QueryVk *queryVk)
     if (mRenderPassCommandBuffer)
     {
         ANGLE_TRY(queryVk->getQueryHelper()->beginRenderPassQuery(this));
+
+        // Update rasterizer discard emulation with primitives generated query if necessary.
+        if (queryVk->getType() == gl::QueryType::PrimitivesGenerated)
+        {
+            updateRasterizerDiscardEnabled(true);
+        }
     }
 
     gl::QueryType type = queryVk->getType();
@@ -5766,6 +5871,12 @@ angle::Result ContextVk::endRenderPassQuery(QueryVk *queryVk)
     if (mRenderPassCommandBuffer)
     {
         queryVk->getQueryHelper()->endRenderPassQuery(this);
+
+        // Update rasterizer discard emulation with primitives generated query if necessary.
+        if (queryVk->getType() == gl::QueryType::PrimitivesGenerated)
+        {
+            updateRasterizerDiscardEnabled(false);
+        }
     }
 
     gl::QueryType type = queryVk->getType();
@@ -5788,6 +5899,9 @@ void ContextVk::pauseRenderPassQueriesIfActive()
         if (activeQuery)
         {
             activeQuery->onRenderPassEnd(this);
+
+            // No need to update rasterizer discard emulation with primitives generated query.  The
+            // state will be updated when the next render pass starts.
         }
     }
 }
@@ -5802,10 +5916,38 @@ angle::Result ContextVk::resumeRenderPassQueriesIfActive()
         if (activeQuery)
         {
             ANGLE_TRY(activeQuery->onRenderPassStart(this));
+
+            // Update rasterizer discard emulation with primitives generated query if necessary.
+            if (activeQuery->getType() == gl::QueryType::PrimitivesGenerated)
+            {
+                updateRasterizerDiscardEnabled(true);
+            }
         }
     }
 
     return angle::Result::Continue;
+}
+
+bool ContextVk::doesPrimitivesGeneratedQuerySupportRasterizerDiscard() const
+{
+    // TODO: If primitives generated is implemented with VK_EXT_primitives_generated_query, check
+    // the corresponding feature bit.  http://anglebug.com/5430.
+
+    // If primitives generated is emulated with pipeline statistics query, it's unknown on which
+    // hardware rasterizer discard is supported.  Assume it's supported on none.
+    if (getFeatures().supportsPipelineStatisticsQuery.enabled)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+bool ContextVk::isEmulatingRasterizerDiscardDuringPrimitivesGeneratedQuery(
+    bool isPrimitivesGeneratedQueryActive) const
+{
+    return isPrimitivesGeneratedQueryActive && mState.isRasterizerDiscardEnabled() &&
+           !doesPrimitivesGeneratedQuerySupportRasterizerDiscard();
 }
 
 QueryVk *ContextVk::getActiveRenderPassQuery(gl::QueryType queryType) const

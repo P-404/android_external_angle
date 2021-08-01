@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 
+#include "RenderDoc.h"
 #include "angle_test_configs.h"
 #include "angle_test_platform.h"
 #include "common/angleutils.h"
@@ -318,6 +319,15 @@ void LoadEntryPointsWithUtilLoader(angle::GLESDriverType driver);
 #define EXPECT_PIXEL_COLOR32F_NEAR(x, y, angleColor, abs_error) \
     EXPECT_PIXEL32F_NEAR(x, y, angleColor.R, angleColor.G, angleColor.B, angleColor.A, abs_error)
 
+#define EXPECT_PIXEL_STENCIL_EQ(x, y, expected)                                    \
+    do                                                                             \
+    {                                                                              \
+        GLubyte actual;                                                            \
+        glReadPixels((x), (y), 1, 1, GL_STENCIL_INDEX, GL_UNSIGNED_BYTE, &actual); \
+        EXPECT_GL_NO_ERROR();                                                      \
+        EXPECT_EQ((expected), actual);                                             \
+    } while (0)
+
 class ANGLETestBase;
 class EGLWindow;
 class GLWindowBase;
@@ -358,6 +368,7 @@ class ANGLETestBase
 
   protected:
     void ANGLETestSetUp();
+    void ANGLETestPreTearDown();
     void ANGLETestTearDown();
 
     virtual void swapBuffers();
@@ -584,6 +595,8 @@ class ANGLETestBase
     const angle::PlatformParameters *mCurrentParams;
     TestFixture *mFixture;
 
+    RenderDoc mRenderDoc;
+
     // Workaround for NVIDIA not being able to share a window with OpenGL and Vulkan.
     static Optional<EGLint> mLastRendererType;
     static Optional<angle::GLESDriverType> mLastLoadedDriver;
@@ -616,6 +629,7 @@ class ANGLETestWithParam : public ANGLETestBase, public ::testing::TestWithParam
 
     void TearDown() final
     {
+        ANGLETestBase::ANGLETestPreTearDown();
         if (mIsSetUp)
         {
             testTearDown();

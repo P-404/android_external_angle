@@ -21,6 +21,7 @@
 #include "compiler/translator/ValidateLimitations.h"
 #include "compiler/translator/ValidateMaxParameters.h"
 #include "compiler/translator/ValidateOutputs.h"
+#include "compiler/translator/ValidateTypeSizeLimitations.h"
 #include "compiler/translator/ValidateVaryingLocations.h"
 #include "compiler/translator/VariablePacker.h"
 #include "compiler/translator/tree_ops/ClampIndirectIndices.h"
@@ -43,14 +44,14 @@
 #include "compiler/translator/tree_ops/SeparateDeclarations.h"
 #include "compiler/translator/tree_ops/SimplifyLoopConditions.h"
 #include "compiler/translator/tree_ops/SplitSequenceOperator.h"
+#include "compiler/translator/tree_ops/apple/AddAndTrueToLoopCondition.h"
+#include "compiler/translator/tree_ops/apple/RewriteDoWhile.h"
+#include "compiler/translator/tree_ops/apple/UnfoldShortCircuitAST.h"
 #include "compiler/translator/tree_ops/gl/ClampFragDepth.h"
 #include "compiler/translator/tree_ops/gl/RegenerateStructNames.h"
 #include "compiler/translator/tree_ops/gl/RewriteRepeatedAssignToSwizzled.h"
 #include "compiler/translator/tree_ops/gl/UseInterfaceBlockFields.h"
 #include "compiler/translator/tree_ops/gl/VectorizeVectorScalarArithmetic.h"
-#include "compiler/translator/tree_ops/gl/mac/AddAndTrueToLoopCondition.h"
-#include "compiler/translator/tree_ops/gl/mac/RewriteDoWhile.h"
-#include "compiler/translator/tree_ops/gl/mac/UnfoldShortCircuitAST.h"
 #include "compiler/translator/tree_ops/vulkan/EarlyFragmentTestsOptimization.h"
 #include "compiler/translator/tree_util/BuiltIn.h"
 #include "compiler/translator/tree_util/IntermNodePatternMatcher.h"
@@ -324,6 +325,13 @@ bool TCompiler::shouldRunLoopAndIndexingValidation(ShCompileOptions compileOptio
            (compileOptions & SH_VALIDATE_LOOP_INDEXING) != 0;
 }
 
+bool TCompiler::shouldLimitTypeSizes() const
+{
+    // WebGL shaders limit the size of variables' types in shaders,
+    // including arrays, structs and interface blocks.
+    return IsWebGLBasedSpec(mShaderSpec);
+}
+
 bool TCompiler::Init(const ShBuiltInResources &resources)
 {
     SetGlobalPoolAllocator(&allocator);
@@ -563,6 +571,32 @@ bool TCompiler::validateAST(TIntermNode *root)
     return true;
 }
 
+bool TCompiler::disableValidateFunctionCall()
+{
+    bool wasEnabled                          = mValidateASTOptions.validateFunctionCall;
+    mValidateASTOptions.validateFunctionCall = false;
+    return wasEnabled;
+}
+
+void TCompiler::restoreValidateFunctionCall(bool enable)
+{
+    ASSERT(!mValidateASTOptions.validateFunctionCall);
+    mValidateASTOptions.validateFunctionCall = enable;
+}
+
+bool TCompiler::disableValidateVariableReferences()
+{
+    bool wasEnabled                                = mValidateASTOptions.validateVariableReferences;
+    mValidateASTOptions.validateVariableReferences = false;
+    return wasEnabled;
+}
+
+void TCompiler::restoreValidateVariableReferences(bool enable)
+{
+    ASSERT(!mValidateASTOptions.validateVariableReferences);
+    mValidateASTOptions.validateVariableReferences = enable;
+}
+
 bool TCompiler::checkAndSimplifyAST(TIntermBlock *root,
                                     const TParseContext &parseContext,
                                     ShCompileOptions compileOptions)
@@ -581,6 +615,11 @@ bool TCompiler::checkAndSimplifyAST(TIntermBlock *root,
 
     if (shouldRunLoopAndIndexingValidation(compileOptions) &&
         !ValidateLimitations(root, mShaderType, &mSymbolTable, &mDiagnostics))
+    {
+        return false;
+    }
+
+    if (shouldLimitTypeSizes() && !ValidateTypeSizeLimitations(root, &mSymbolTable, &mDiagnostics))
     {
         return false;
     }
@@ -1258,6 +1297,9 @@ bool TCompiler::emulatePrecisionIfNeeded(TIntermBlock *root,
 
     if (*isNeeded)
     {
+        // TODO: remove this transformation.  http://anglebug.com/6059
+        mValidateASTOptions.validateNoRawFunctionCalls = false;
+
         EmulatePrecision emulatePrecision(&getSymbolTable());
         root->traverse(&emulatePrecision);
         if (!emulatePrecision.updateTree(this, root))

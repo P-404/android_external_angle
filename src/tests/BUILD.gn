@@ -59,6 +59,12 @@ if (is_mac) {
     "test_expectations/GPUTestConfig_mac.h",
   ]
 }
+if (is_ios) {
+  test_expectation_sources_ios = [
+    "test_expectations/GPUTestConfig_ios.mm",
+    "test_expectations/GPUTestConfig_ios.h",
+  ]
+}
 
 angle_static_library("angle_test_expectations") {
   public_deps = [
@@ -71,10 +77,8 @@ angle_static_library("angle_test_expectations") {
     frameworks = [ "Cocoa.framework" ]
   }
   if (is_ios) {
-    sources += [
-      "test_expectations/GPUTestConfig_ios.h",
-      "test_expectations/GPUTestConfig_ios.mm",
-    ]
+    sources += test_expectation_sources_ios
+    frameworks = [ "Foundation.framework" ]
   }
 }
 
@@ -104,6 +108,9 @@ template("angle_common_test_utils") {
       "//third_party/googletest:gtest",
     ]
     sources = [
+      "$angle_root/third_party/renderdoc/src/renderdoc_app.h",
+      "test_utils/RenderDoc.cpp",
+      "test_utils/RenderDoc.h",
       "test_utils/angle_test_configs.cpp",
       "test_utils/angle_test_configs.h",
       "test_utils/angle_test_instantiate.cpp",
@@ -380,6 +387,12 @@ if (is_win || is_linux || is_chromeos || is_android || is_apple) {
 if (build_angle_perftests) {
   import("angle_perftests.gni")
 
+  config("angle_trace_perftests_config") {
+    if (build_angle_trace_perf_tests) {
+      defines = [ "ANGLE_TRACE_PERF_TESTS" ]
+    }
+  }
+
   angle_source_set("angle_trace_perftests") {
     testonly = true
 
@@ -399,6 +412,7 @@ if (build_angle_perftests) {
         "$angle_root/util:angle_png_utils",
         "restricted_traces:angle_restricted_traces",
       ]
+      public_configs = [ ":angle_trace_perftests_config" ]
       suppressed_configs +=
           [ "$angle_root:constructor_and_destructor_warnings" ]
     }
@@ -475,6 +489,7 @@ if (build_angle_gles1_conform_tests) {
       # Remove when crbug.com/428099 is resolved.
       cflags += [
         "-Wno-implicit-function-declaration",
+        "-Wno-implicit-int-float-conversion",
         "-Wno-int-to-pointer-cast",
         "-Wno-self-assign",
         "-Wno-sign-compare",
@@ -525,6 +540,10 @@ if (build_angle_gles1_conform_tests) {
       "$angle_root:angle_static",
       "$angle_root:gl_prototypes",
     ]
+
+    if (is_clang) {
+      cflags_c = [ "-Wno-implicit-fallthrough" ]
+    }
 
     testonly = true
 
@@ -1256,6 +1275,13 @@ if (build_angle_deqp_tests && !is_fuchsia) {
         "deqp_support/tcuANGLEPlatform.cpp",
         "deqp_support/tcuANGLEPlatform.h",
       ]
+
+      if ((is_mac || is_ios) && !is_component_build) {
+        ldflags = [
+          "-install_name",
+          "@rpath/lib${shared_library_name}.dylib",
+        ]
+      }
     }
 
     if (!build_with_chromium) {

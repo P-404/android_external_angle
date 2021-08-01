@@ -600,37 +600,37 @@ basic_types_enumeration = [
     'USamplerCubeArray',
     'SamplerVideoWEBGL',
     'Image2D',
-    'IImage2D',
-    'UImage2D',
     'Image3D',
-    'IImage3D',
-    'UImage3D',
     'Image2DArray',
-    'IImage2DArray',
-    'UImage2DArray',
     'ImageCube',
-    'IImageCube',
-    'UImageCube',
     'Image1D',
-    'IImage1D',
-    'UImage1D',
     'Image1DArray',
-    'IImage1DArray',
-    'UImage1DArray',
     'Image2DMS',
-    'IImage2DMS',
-    'UImage2DMS',
     'Image2DMSArray',
-    'IImage2DMSArray',
-    'UImage2DMSArray',
     'ImageCubeArray',
-    'IImageCubeArray',
-    'UImageCubeArray',
     'ImageRect',
-    'IImageRect',
-    'UImageRect',
     'ImageBuffer',
+    'IImage2D',
+    'IImage3D',
+    'IImage2DArray',
+    'IImageCube',
+    'IImage1D',
+    'IImage1DArray',
+    'IImage2DMS',
+    'IImage2DMSArray',
+    'IImageCubeArray',
+    'IImageRect',
     'IImageBuffer',
+    'UImage2D',
+    'UImage3D',
+    'UImage2DArray',
+    'UImageCube',
+    'UImage1D',
+    'UImage1DArray',
+    'UImage2DMS',
+    'UImage2DMSArray',
+    'UImageCubeArray',
+    'UImageRect',
     'UImageBuffer',
     'SubpassInput',
     'ISubpassInput',
@@ -660,7 +660,8 @@ def get_basic_mangled_name(basic):
 
 
 essl_levels = [
-    'ESSL3_2_BUILTINS', 'ESSL3_1_BUILTINS', 'ESSL3_BUILTINS', 'ESSL1_BUILTINS', 'COMMON_BUILTINS'
+    'ESSL3_2_BUILTINS', 'ESSL3_1_BUILTINS', 'ESSL3_BUILTINS', 'ESSL1_BUILTINS', 'COMMON_BUILTINS',
+    'ESSL_VULKAN_BUILTINS'
 ]
 
 glsl_levels = [
@@ -682,6 +683,8 @@ def generate_suffix_from_level(level):
 def get_essl_shader_version_for_level(level):
     if level == None:
         return '-1'
+    elif level == 'ESSL_VULKAN_BUILTINS':
+        return 'kESSLVulkanOnly'
     elif level == 'ESSL3_2_BUILTINS':
         return '320'
     elif level == 'ESSL3_1_BUILTINS':
@@ -852,7 +855,7 @@ class GroupedList:
     def get_offsets(self):
         return self.offsets
 
-    def update_arrays(self):
+    def update_arrays(self, essl_only):
 
         def add_rule(rules, spec, level, shaders, extension, symbol):
             var = ("&TableBase::%s" % symbol) if symbol.startswith("m_gl") else None
@@ -894,7 +897,7 @@ class GroupedList:
                     add_rule(rules, "ESSL", data['essl_level'], data['shader_type'], None,
                              data["symbol"])
 
-                if "symbol" in data and "glsl_level" in data:
+                if "symbol" in data and "glsl_level" in data and not essl_only:
                     add_rule(rules, "GLSL", data['glsl_level'], data['shader_type'], None,
                              data["symbol"])
 
@@ -902,7 +905,7 @@ class GroupedList:
                     add_rule(rules, "ESSL", data['essl_level2'], data['shader_type2'], None,
                              data["symbol2"])
 
-                if "symbol2" in data and "glsl_level2" in data:
+                if "symbol2" in data and "glsl_level2" in data and not essl_only:
                     add_rule(rules, "GLSL", data['glsl_level2'], data['shader_type2'], None,
                              data["symbol2"])
 
@@ -910,7 +913,7 @@ class GroupedList:
                     add_rule(rules, "ESSL", data['essl_level3'], data['shader_type3'], None,
                              data["symbol3"])
 
-                if "symbol3" in data and "glsl_level3" in data:
+                if "symbol3" in data and "glsl_level3" in data and not essl_only:
                     add_rule(rules, "GLSL", data['glsl_level3'], data['shader_type3'], None,
                              data["symbol3"])
 
@@ -918,7 +921,7 @@ class GroupedList:
                     add_rule(rules, "ESSL", data['essl_level4'], data['shader_type4'], None,
                              data["symbol4"])
 
-                if "symbol4" in data and "glsl_level4" in data:
+                if "symbol4" in data and "glsl_level4" in data and not essl_only:
                     add_rule(rules, "GLSL", data['glsl_level4'], data['shader_type4'], None,
                              data["symbol4"])
 
@@ -926,7 +929,7 @@ class GroupedList:
                     add_rule(rules, "ESSL", data["essl_ext_level"], data["essl_ext_shader_type"],
                              data["essl_extension"], data["essl_ext_symbol"])
 
-                if "glsl_ext_symbol" in data:
+                if "glsl_ext_symbol" in data and not essl_only:
                     add_rule(rules, "GLSL", data["glsl_ext_level"], data["glsl_ext_shader_type"],
                              data["glsl_extension"], data["glsl_ext_symbol"])
 
@@ -1143,11 +1146,11 @@ class TType:
             return type_obj
         if glsl_header_type.startswith('out '):
             type_obj = self.parse_type(glsl_header_type[4:])
-            type_obj['qualifier'] = 'Out'
+            type_obj['qualifier'] = 'ParamOut'
             return type_obj
         if glsl_header_type.startswith('inout '):
             type_obj = self.parse_type(glsl_header_type[6:])
-            type_obj['qualifier'] = 'InOut'
+            type_obj['qualifier'] = 'ParamInOut'
             return type_obj
 
         basic_type_map = {
@@ -1456,8 +1459,8 @@ def get_known_to_not_have_side_effects(function_props):
         return 'false'
     else:
         for param in get_parameters(function_props):
-            if 'qualifier' in param.data and (param.data['qualifier'] == 'Out' or
-                                              param.data['qualifier'] == 'InOut'):
+            if 'qualifier' in param.data and (param.data['qualifier'] == 'ParamOut' or
+                                              param.data['qualifier'] == 'ParamInOut'):
                 return 'false'
         return 'true'
 
@@ -1492,9 +1495,9 @@ def get_unique_identifier_name(function_name, parameters):
 def get_variable_name_to_store_parameter(param):
     unique_name = 'pt'
     if 'qualifier' in param.data:
-        if param.data['qualifier'] == 'Out':
+        if param.data['qualifier'] == 'ParamOut':
             unique_name += '_o_'
-        if param.data['qualifier'] == 'InOut':
+        if param.data['qualifier'] == 'ParamInOut':
             unique_name += '_io_'
     unique_name += param.get_mangled_name()
     return unique_name
@@ -1506,9 +1509,9 @@ def get_variable_name_to_store_parameters(parameters):
     unique_name = 'p'
     for param in parameters:
         if 'qualifier' in param.data:
-            if param.data['qualifier'] == 'Out':
+            if param.data['qualifier'] == 'ParamOut':
                 unique_name += '_o_'
-            if param.data['qualifier'] == 'InOut':
+            if param.data['qualifier'] == 'ParamInOut':
                 unique_name += '_io_'
         unique_name += param.get_mangled_name()
     return unique_name
@@ -2116,7 +2119,7 @@ def generate_files(essl_only, args, functions_txt_filename, variables_json_filen
     for group_name, group in parsed_variables.items():
         process_variable_group('NONE', group_name, group, symbols, variables, mangled_builtins)
 
-    mangled_builtins.update_arrays()
+    mangled_builtins.update_arrays(essl_only)
 
     output_strings = {
         'script_name':

@@ -218,9 +218,11 @@ const TFunction *MonomorphizeFunction(TSymbolTable *symbolTable,
                 if (asBinary->getOp() == EOpIndexIndirect)
                 {
                     TIntermTyped *index = asBinary->getRight();
+                    TType *indexType    = new TType(index->getType());
+                    indexType->setQualifier(EvqParamIn);
 
-                    TVariable *param = new TVariable(symbolTable, kEmptyImmutableString,
-                                                     &index->getType(), SymbolType::AngleInternal);
+                    TVariable *param = new TVariable(symbolTable, kEmptyImmutableString, indexType,
+                                                     SymbolType::AngleInternal);
                     substituteFunction->addParameter(param);
 
                     // The argument now uses the function parameters as indices.
@@ -501,12 +503,11 @@ void SortDeclarations(TIntermBlock *root)
     // Replace root's sequence with |replacement|.
     root->replaceAllChildren(replacement);
 }
-}  // anonymous namespace
 
-bool MonomorphizeUnsupportedFunctionsInVulkanGLSL(TCompiler *compiler,
-                                                  TIntermBlock *root,
-                                                  TSymbolTable *symbolTable,
-                                                  ShCompileOptions compileOptions)
+bool MonomorphizeUnsupportedFunctionsInVulkanGLSLImpl(TCompiler *compiler,
+                                                      TIntermBlock *root,
+                                                      TSymbolTable *symbolTable,
+                                                      ShCompileOptions compileOptions)
 {
     // First, sort out the declarations such that all non-function declarations are placed before
     // function definitions.  This way when the function is replaced with one that references said
@@ -541,5 +542,22 @@ bool MonomorphizeUnsupportedFunctionsInVulkanGLSL(TCompiler *compiler,
     }
 
     return true;
+}
+}  // anonymous namespace
+
+bool MonomorphizeUnsupportedFunctionsInVulkanGLSL(TCompiler *compiler,
+                                                  TIntermBlock *root,
+                                                  TSymbolTable *symbolTable,
+                                                  ShCompileOptions compileOptions)
+{
+    // This function actually applies multiple transformation, and the AST may not be valid until
+    // the transformations are entirely done.  Some validation is momentarily disabled.
+    bool enableValidateFunctionCall = compiler->disableValidateFunctionCall();
+
+    bool result = MonomorphizeUnsupportedFunctionsInVulkanGLSLImpl(compiler, root, symbolTable,
+                                                                   compileOptions);
+
+    compiler->restoreValidateFunctionCall(enableValidateFunctionCall);
+    return result && compiler->validateAST(root);
 }
 }  // namespace sh

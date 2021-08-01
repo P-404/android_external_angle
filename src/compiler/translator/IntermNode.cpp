@@ -404,9 +404,9 @@ bool TIntermAggregate::replaceChildNode(TIntermNode *original, TIntermNode *repl
 
 TIntermBlock::TIntermBlock(const TIntermBlock &node)
 {
-    for (TIntermNode *node : node.mStatements)
+    for (TIntermNode *intermNode : node.mStatements)
     {
-        mStatements.push_back(node->deepCopy());
+        mStatements.push_back(intermNode->deepCopy());
     }
 
     ASSERT(!node.mIsTreeRoot);
@@ -506,9 +506,9 @@ bool TIntermDeclaration::replaceChildNode(TIntermNode *original, TIntermNode *re
 
 TIntermDeclaration::TIntermDeclaration(const TIntermDeclaration &node)
 {
-    for (TIntermNode *node : node.mDeclarators)
+    for (TIntermNode *intermNode : node.mDeclarators)
     {
-        mDeclarators.push_back(node->deepCopy());
+        mDeclarators.push_back(intermNode->deepCopy());
     }
 }
 
@@ -762,6 +762,22 @@ bool TIntermAggregate::hasConstantValue() const
     for (TIntermNode *constructorArg : mArguments)
     {
         if (!constructorArg->getAsTyped()->hasConstantValue())
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool TIntermAggregate::isConstantNullValue() const
+{
+    if (!isConstructor())
+    {
+        return false;
+    }
+    for (TIntermNode *constructorArg : mArguments)
+    {
+        if (!constructorArg->getAsTyped()->isConstantNullValue())
         {
             return false;
         }
@@ -1058,6 +1074,11 @@ bool TIntermTyped::hasConstantValue() const
     return false;
 }
 
+bool TIntermTyped::isConstantNullValue() const
+{
+    return false;
+}
+
 const TConstantUnion *TIntermTyped::getConstantValue() const
 {
     return nullptr;
@@ -1350,6 +1371,8 @@ void TIntermUnary::promote()
         default:
             setType(mOperand->getType());
             mType.setQualifier(resultQualifier);
+            // Result is an intermediate value, so make sure it's identified as such.
+            mType.setInterfaceBlock(nullptr);
             break;
     }
 }
@@ -1799,6 +1822,19 @@ void TIntermBinary::promote()
 
 bool TIntermConstantUnion::hasConstantValue() const
 {
+    return true;
+}
+
+bool TIntermConstantUnion::isConstantNullValue() const
+{
+    const size_t size = mType.getObjectSize();
+    for (size_t index = 0; index < size; ++index)
+    {
+        if (!mUnionArrayPointer[index].isZero())
+        {
+            return false;
+        }
+    }
     return true;
 }
 

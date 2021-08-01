@@ -16,10 +16,10 @@
 
 #include "sys/stat.h"
 
+#include "common/angle_version.h"
 #include "common/mathutil.h"
 #include "common/string_utils.h"
 #include "common/system_utils.h"
-#include "common/version.h"
 #include "libANGLE/Config.h"
 #include "libANGLE/Context.h"
 #include "libANGLE/Display.h"
@@ -132,6 +132,8 @@ std::ostream &operator<<(std::ostream &os, gl::ContextID contextId)
     return os;
 }
 
+constexpr static gl::ContextID kSharedContextId = {0};
+
 struct FmtCapturePrefix
 {
     FmtCapturePrefix(gl::ContextID contextIdIn, const std::string &captureLabelIn)
@@ -151,7 +153,12 @@ std::ostream &operator<<(std::ostream &os, const FmtCapturePrefix &fmt)
     {
         os << fmt.captureLabel;
     }
-    os << "_capture_context" << fmt.contextId;
+
+    if (fmt.contextId != kSharedContextId)
+    {
+        os << "_capture_context" << fmt.contextId;
+    }
+
     return os;
 }
 
@@ -178,7 +185,19 @@ struct FmtReplayFunction
 
 std::ostream &operator<<(std::ostream &os, const FmtReplayFunction &fmt)
 {
-    os << "ReplayContext" << fmt.contextId << "Frame" << fmt.frameIndex;
+    os << "ReplayContext";
+
+    if (fmt.contextId == kSharedContextId)
+    {
+        os << "Shared";
+    }
+    else
+    {
+        os << fmt.contextId;
+    }
+
+    os << "Frame" << fmt.frameIndex;
+
     if (fmt.partId != kNoPartId)
     {
         os << "Part" << fmt.partId;
@@ -189,14 +208,27 @@ std::ostream &operator<<(std::ostream &os, const FmtReplayFunction &fmt)
 
 struct FmtSetupFunction
 {
-    FmtSetupFunction(uint32_t partIdIn) : partId(partIdIn) {}
+    FmtSetupFunction(uint32_t partIdIn, gl::ContextID contextIdIn)
+        : partId(partIdIn), contextId(contextIdIn)
+    {}
 
     uint32_t partId;
+    gl::ContextID contextId;
 };
 
 std::ostream &operator<<(std::ostream &os, const FmtSetupFunction &fmt)
 {
-    os << "SetupReplay";
+    os << "SetupReplayContext";
+
+    if (fmt.contextId == kSharedContextId)
+    {
+        os << "Shared";
+    }
+    else
+    {
+        os << fmt.contextId;
+    }
+
     if (fmt.partId != kNoPartId)
     {
         os << "Part" << fmt.partId;
@@ -240,7 +272,7 @@ std::ostream &operator<<(std::ostream &os, const FmtFunction &fmt)
             break;
 
         case ReplayFunc::Setup:
-            os << FmtSetupFunction(fmt.partId);
+            os << FmtSetupFunction(fmt.partId, fmt.contextId);
             break;
 
         case ReplayFunc::Reset:
@@ -388,7 +420,7 @@ void WriteStringPointerParamReplay(DataTracker *dataTracker,
     {
         // null terminate C style string
         ASSERT(data.size() > 0 && data.back() == '\0');
-        strings.push_back(std::string(data.begin(), data.end() - 1));
+        strings.emplace_back(data.begin(), data.end() - 1);
     }
 
     int counter = dataTracker->getStringCounters().getStringCounter(strings);
@@ -448,10 +480,11 @@ void WriteResourceIDPointerParamReplay(DataTracker *dataTracker,
     ASSERT(resourceIDType != ResourceIDType::InvalidEnum);
     const char *name = GetResourceIDTypeName(resourceIDType);
 
-    GLsizei n = call.params.getParamFlexName("n", "count", ParamType::TGLsizei, 0).value.GLsizeiVal;
+    ASSERT(param.dataNElements > 0);
     ASSERT(param.data.size() == 1);
+
     const ParamT *returnedIDs = reinterpret_cast<const ParamT *>(param.data[0].data());
-    for (GLsizei resIndex = 0; resIndex < n; ++resIndex)
+    for (GLsizei resIndex = 0; resIndex < param.dataNElements; ++resIndex)
     {
         ParamT id = returnedIDs[resIndex];
         if (resIndex > 0)
@@ -806,6 +839,7 @@ void WriteInitReplayCall(bool compression,
         << readBufferSize << ");\n";
 }
 
+// TODO (http://anglebug.com/4599): Reset more state on frame loop
 void MaybeResetResources(std::stringstream &out,
                          ResourceIDType resourceIDType,
                          DataTracker *dataTracker,
@@ -817,17 +851,20 @@ void MaybeResetResources(std::stringstream &out,
     {
         case ResourceIDType::Buffer:
         {
-            BufferSet &newBuffers           = resourceTracker->getNewBuffers();
-            BufferCalls &bufferRegenCalls   = resourceTracker->getBufferRegenCalls();
-            BufferCalls &bufferRestoreCalls = resourceTracker->getBufferRestoreCalls();
-            BufferCalls &bufferMapCalls     = resourceTracker->getBufferMapCalls();
-            BufferCalls &bufferUnmapCalls   = resourceTracker->getBufferUnmapCalls();
+            TrackedResource &trackedBuffers =
+                resourceTracker->getTrackedResource(ResourceIDType::Buffer);
+            ResourceSet &newBuffers           = trackedBuffers.getNewResources();
+            ResourceCalls &bufferRegenCalls   = trackedBuffers.getResourceRegenCalls();
+            ResourceCalls &bufferRestoreCalls = trackedBuffers.getResourceRestoreCalls();
+
+            BufferCalls &bufferMapCalls   = resourceTracker->getBufferMapCalls();
+            BufferCalls &bufferUnmapCalls = resourceTracker->getBufferUnmapCalls();
 
             // If we have any new buffers generated and not deleted during the run, delete them now
             if (!newBuffers.empty())
             {
                 out << "    const GLuint deleteBuffers[] = {";
-                BufferSet::iterator bufferIter = newBuffers.begin();
+                ResourceSet::iterator bufferIter = newBuffers.begin();
                 for (size_t i = 0; bufferIter != newBuffers.end(); ++i, ++bufferIter)
                 {
                     if (i > 0)
@@ -838,15 +875,15 @@ void MaybeResetResources(std::stringstream &out,
                     {
                         out << "\n        ";
                     }
-                    out << "gBufferMap[" << (*bufferIter).value << "]";
+                    out << "gBufferMap[" << *bufferIter << "]";
                 }
                 out << "};\n";
                 out << "    glDeleteBuffers(" << newBuffers.size() << ", deleteBuffers);\n";
             }
 
             // If any of our starting buffers were deleted during the run, recreate them
-            BufferSet &buffersToRegen = resourceTracker->getBuffersToRegen();
-            for (const gl::BufferID id : buffersToRegen)
+            ResourceSet &buffersToRegen = trackedBuffers.getResourcesToRegen();
+            for (GLuint id : buffersToRegen)
             {
                 // Emit their regen calls
                 for (CallCapture &call : bufferRegenCalls[id])
@@ -858,8 +895,8 @@ void MaybeResetResources(std::stringstream &out,
             }
 
             // If any of our starting buffers were modified during the run, restore their contents
-            BufferSet &buffersToRestore = resourceTracker->getBuffersToRestore();
-            for (const gl::BufferID id : buffersToRestore)
+            ResourceSet &buffersToRestore = trackedBuffers.getResourcesToRestore();
+            for (GLuint id : buffersToRestore)
             {
                 if (resourceTracker->getStartingBuffersMappedCurrent(id))
                 {
@@ -886,8 +923,8 @@ void MaybeResetResources(std::stringstream &out,
             }
 
             // Update the map/unmap of buffers to match the starting state
-            BufferSet startingBuffers = resourceTracker->getStartingBuffers();
-            for (const gl::BufferID id : startingBuffers)
+            ResourceSet startingBuffers = trackedBuffers.getStartingResources();
+            for (GLuint id : startingBuffers)
             {
                 // If the buffer was mapped at the start, but is not mapped now, we need to map
                 if (resourceTracker->getStartingBuffersMappedInitial(id) &&
@@ -928,17 +965,77 @@ void MaybeResetResources(std::stringstream &out,
         }
         case ResourceIDType::ShaderProgram:
         {
-            ProgramSet &newPrograms = resourceTracker->getNewPrograms();
+            ResourceSet &newPrograms =
+                resourceTracker->getTrackedResource(ResourceIDType::ShaderProgram)
+                    .getNewResources();
 
             // If we have any new programs created and not deleted during the run, delete them now
             for (const auto &newProgram : newPrograms)
             {
-                out << "    glDeleteProgram(gShaderProgramMap[" << newProgram.value << "]);\n";
+                out << "    glDeleteProgram(gShaderProgramMap[" << newProgram << "]);\n";
             }
 
             // TODO (http://anglebug.com/5968): Handle programs that need regen
             // This would only happen if a starting program was deleted during the run
-            ASSERT(resourceTracker->getProgramsToRegen().empty());
+            ASSERT(resourceTracker->getTrackedResource(ResourceIDType::ShaderProgram)
+                       .getResourcesToRegen()
+                       .empty());
+            break;
+        }
+        case ResourceIDType::Texture:
+        {
+            TrackedResource &trackedTextures =
+                resourceTracker->getTrackedResource(ResourceIDType::Texture);
+            ResourceSet &newTextures           = trackedTextures.getNewResources();
+            ResourceCalls &textureRegenCalls   = trackedTextures.getResourceRegenCalls();
+            ResourceCalls &textureRestoreCalls = trackedTextures.getResourceRestoreCalls();
+
+            // If we have any new textures generated and not deleted during the run, delete them now
+            if (!newTextures.empty())
+            {
+                out << "    const GLuint deleteTextures[] = {";
+                ResourceSet::iterator textureIter = newTextures.begin();
+                for (size_t i = 0; textureIter != newTextures.end(); ++i, ++textureIter)
+                {
+                    if (i > 0)
+                    {
+                        out << ", ";
+                    }
+                    if ((i % 4) == 0)
+                    {
+                        out << "\n        ";
+                    }
+                    out << "gTextureMap[" << *textureIter << "]";
+                }
+                out << "};\n";
+                out << "    glDeleteTextures(" << newTextures.size() << ", deleteTextures);\n";
+            }
+
+            // If any of our starting textures were deleted during the run, regen them
+            ResourceSet &texturesToRegen = trackedTextures.getResourcesToRegen();
+            for (GLuint id : texturesToRegen)
+            {
+                // Emit their regen calls
+                for (CallCapture &call : textureRegenCalls[id])
+                {
+                    out << "    ";
+                    WriteCppReplayForCall(call, dataTracker, out, header, binaryData);
+                    out << ";\n";
+                }
+            }
+
+            // If any of our starting textures were modified during the run, restore their contents
+            ResourceSet &texturesToRestore = trackedTextures.getResourcesToRestore();
+            for (GLuint id : texturesToRestore)
+            {
+                // Emit their restore calls
+                for (CallCapture &call : textureRestoreCalls[id])
+                {
+                    out << "    ";
+                    WriteCppReplayForCall(call, dataTracker, out, header, binaryData);
+                    out << ";\n";
+                }
+            }
             break;
         }
         default:
@@ -978,7 +1075,7 @@ void MaybeResetOpaqueTypeObjects(std::stringstream &out,
     MaybeResetFenceSyncObjects(out, dataTracker, header, resourceTracker, binaryData);
 }
 
-void WriteCppReplayFunctionWithParts(const gl::Context *context,
+void WriteCppReplayFunctionWithParts(const gl::ContextID contextID,
                                      ReplayFunc replayFunc,
                                      DataTracker *dataTracker,
                                      uint32_t frameIndex,
@@ -997,8 +1094,8 @@ void WriteCppReplayFunctionWithParts(const gl::Context *context,
     // overflowing the stack
     if (calls.size() > kFunctionSizeLimit)
     {
-        callStreamParts << "void "
-                        << FmtFunction(replayFunc, context->id(), frameIndex, ++partCount) << "\n";
+        callStreamParts << "void " << FmtFunction(replayFunc, contextID, frameIndex, ++partCount)
+                        << "\n";
         callStreamParts << "{\n";
     }
 
@@ -1013,8 +1110,7 @@ void WriteCppReplayFunctionWithParts(const gl::Context *context,
             callStreamParts << "}\n";
             callStreamParts << "\n";
             callStreamParts << "void "
-                            << FmtFunction(replayFunc, context->id(), frameIndex, ++partCount)
-                            << "\n";
+                            << FmtFunction(replayFunc, contextID, frameIndex, ++partCount) << "\n";
             callStreamParts << "{\n";
         }
     }
@@ -1030,7 +1126,7 @@ void WriteCppReplayFunctionWithParts(const gl::Context *context,
         // Write out the calls to the parts
         for (int i = 1; i <= partCount; i++)
         {
-            callStream << "    " << FmtFunction(replayFunc, context->id(), frameIndex, i) << ";\n";
+            callStream << "    " << FmtFunction(replayFunc, contextID, frameIndex, i) << ";\n";
         }
     }
     else
@@ -1040,26 +1136,116 @@ void WriteCppReplayFunctionWithParts(const gl::Context *context,
     }
 }
 
-void WriteCppReplay(bool compression,
-                    const std::string &outDir,
-                    const gl::Context *context,
-                    const std::string &captureLabel,
-                    uint32_t frameIndex,
-                    uint32_t frameCount,
-                    const std::vector<CallCapture> &frameCalls,
-                    const std::vector<CallCapture> &setupCalls,
-                    ResourceTracker *resourceTracker,
-                    std::vector<uint8_t> *binaryData,
-                    const gl::AttribArray<size_t> &clientArraySizes,
-                    size_t readBufferSize,
-                    bool serializeStateEnabled)
+// Auxiliary contexts are other contexts in the share group that aren't the context calling
+// eglSwapBuffers().
+void WriteAuxiliaryContextCppSetupReplay(bool compression,
+                                         const std::string &outDir,
+                                         const gl::Context *context,
+                                         const std::string &captureLabel,
+                                         uint32_t frameIndex,
+                                         const std::vector<CallCapture> &setupCalls,
+                                         std::vector<uint8_t> *binaryData,
+                                         bool serializeStateEnabled,
+                                         const FrameCaptureShared &frameCaptureShared)
 {
+    ASSERT(frameCaptureShared.getWindowSurfaceContextID() != context->id());
+
+    DataTracker dataTracker;
+
+    std::stringstream out;
+    std::stringstream include;
+    std::stringstream header;
+
+    include << "#include \"" << FmtCapturePrefix(context->id(), captureLabel) << ".h\"\n";
+    include << "#include \"angle_trace_gl.h\"\n";
+    include << "";
+    include << "\n";
+    include << "namespace\n";
+    include << "{\n";
+
+    if (!captureLabel.empty())
+    {
+        header << "namespace " << captureLabel << "\n";
+        header << "{\n";
+        out << "namespace " << captureLabel << "\n";
+        out << "{\n";
+    }
+
+    std::stringstream setupCallStream;
+
+    header << "void " << FmtSetupFunction(kNoPartId, context->id()) << ";\n";
+    setupCallStream << "void " << FmtSetupFunction(kNoPartId, context->id()) << "\n";
+    setupCallStream << "{\n";
+
+    WriteCppReplayFunctionWithParts(context->id(), ReplayFunc::Setup, &dataTracker, frameIndex,
+                                    binaryData, setupCalls, include, setupCallStream, out);
+
+    out << setupCallStream.str();
+    out << "}\n";
+    out << "\n";
+
+    if (!captureLabel.empty())
+    {
+        header << "} // namespace " << captureLabel << "\n";
+        out << "} // namespace " << captureLabel << "\n";
+    }
+
+    include << "}  // namespace\n";
+
+    // Write out the source file.
+    {
+        std::string outString    = out.str();
+        std::string headerString = include.str();
+
+        std::string cppFilePath =
+            GetCaptureFilePath(outDir, context->id(), captureLabel, frameIndex, ".cpp");
+
+        SaveFileHelper saveCpp(cppFilePath);
+        saveCpp << headerString << "\n" << outString;
+    }
+
+    // Write out the header file.
+    {
+        std::string headerContents = header.str();
+
+        std::stringstream headerPathStream;
+        headerPathStream << outDir << FmtCapturePrefix(context->id(), captureLabel) << ".h";
+        std::string headerPath = headerPathStream.str();
+
+        SaveFileHelper saveHeader(headerPath);
+        saveHeader << headerContents;
+    }
+}
+
+void WriteWindowSurfaceContextCppReplay(bool compression,
+                                        const std::string &outDir,
+                                        const gl::Context *context,
+                                        const std::string &captureLabel,
+                                        uint32_t frameIndex,
+                                        uint32_t frameCount,
+                                        const std::vector<CallCapture> &frameCalls,
+                                        const std::vector<CallCapture> &setupCalls,
+                                        ResourceTracker *resourceTracker,
+                                        std::vector<uint8_t> *binaryData,
+                                        bool serializeStateEnabled,
+                                        const FrameCaptureShared &frameCaptureShared)
+{
+    ASSERT(frameCaptureShared.getWindowSurfaceContextID() == context->id());
+
     DataTracker dataTracker;
 
     std::stringstream out;
     std::stringstream header;
 
-    header << "#include \"" << FmtCapturePrefix(context->id(), captureLabel) << ".h\"\n";
+    egl::ShareGroup *shareGroup      = context->getShareGroup();
+    egl::ContextSet *shareContextSet = shareGroup->getContexts();
+
+    header << "#include \"" << FmtCapturePrefix(kSharedContextId, captureLabel) << ".h\"\n";
+    for (gl::Context *shareContext : *shareContextSet)
+    {
+        header << "#include \"" << FmtCapturePrefix(shareContext->id(), captureLabel) << ".h\"\n";
+    }
+
     header << "#include \"angle_trace_gl.h\"\n";
     header << "";
     header << "\n";
@@ -1075,18 +1261,27 @@ void WriteCppReplay(bool compression,
     {
         std::stringstream setupCallStream;
 
-        setupCallStream << "void " << FmtSetupFunction(kNoPartId) << "\n";
+        setupCallStream << "void " << FmtSetupFunction(kNoPartId, context->id()) << "\n";
         setupCallStream << "{\n";
 
-        size_t maxClientArraySize = MaxClientArraySize(clientArraySizes);
-
-        WriteInitReplayCall(compression, setupCallStream, context->id(), captureLabel,
-                            maxClientArraySize, readBufferSize);
-        WriteCppReplayFunctionWithParts(context, ReplayFunc::Setup, &dataTracker, frameIndex,
+        WriteCppReplayFunctionWithParts(context->id(), ReplayFunc::Setup, &dataTracker, frameIndex,
                                         binaryData, setupCalls, header, setupCallStream, out);
 
         out << setupCallStream.str();
         out << "}\n";
+        out << "\n";
+        out << "void SetupReplay()\n";
+        out << "{\n";
+        out << "    " << captureLabel << "::InitReplay();\n";
+
+        // Setup all of the shared objects.
+        out << "    " << captureLabel << "::" << FmtSetupFunction(kNoPartId, kSharedContextId)
+            << ";\n";
+
+        // Setup the presentation (this) context before any other contexts in the share group.
+        out << "    " << FmtSetupFunction(kNoPartId, context->id()) << ";\n";
+        out << "}\n";
+        out << "\n";
     }
 
     if (frameIndex == frameCount)
@@ -1095,10 +1290,9 @@ void WriteCppReplay(bool compression,
         out << "void " << FmtResetFunction() << "\n";
         out << "{\n";
 
+        // TODO(http://anglebug.com/5878): Look at moving this into the shared context file since
+        // it's resetting shared objects.
         std::stringstream restoreCallStream;
-
-        // For now, we only reset buffer states
-        // TODO (http://anglebug.com/4599): Reset more state on frame loop
         for (ResourceIDType resourceType : AllEnums<ResourceIDType>())
         {
             MaybeResetResources(restoreCallStream, resourceType, &dataTracker, header,
@@ -1125,13 +1319,14 @@ void WriteCppReplay(bool compression,
         out << "{\n";
     }
 
+    if (!frameCalls.empty())
     {
         std::stringstream callStream;
 
         callStream << "void " << FmtReplayFunction(context->id(), frameIndex) << "\n";
         callStream << "{\n";
 
-        WriteCppReplayFunctionWithParts(context, ReplayFunc::Replay, &dataTracker, frameIndex,
+        WriteCppReplayFunctionWithParts(context->id(), ReplayFunc::Replay, &dataTracker, frameIndex,
                                         binaryData, frameCalls, header, callStream, out);
 
         out << callStream.str();
@@ -1169,6 +1364,84 @@ void WriteCppReplay(bool compression,
 
         SaveFileHelper saveCpp(cppFilePath);
         saveCpp << headerString << "\n" << outString;
+    }
+}
+
+void WriteSharedContextCppReplay(bool compression,
+                                 const std::string &outDir,
+                                 const std::string &captureLabel,
+                                 uint32_t frameIndex,
+                                 uint32_t frameCount,
+                                 const std::vector<CallCapture> &setupCalls,
+                                 ResourceTracker *resourceTracker,
+                                 std::vector<uint8_t> *binaryData,
+                                 bool serializeStateEnabled,
+                                 const FrameCaptureShared &frameCaptureShared)
+{
+    DataTracker dataTracker;
+
+    std::stringstream out;
+    std::stringstream include;
+    std::stringstream header;
+
+    include << "#include \"" << FmtCapturePrefix(kSharedContextId, captureLabel) << ".h\"\n";
+    include << "#include \"angle_trace_gl.h\"\n";
+    include << "";
+    include << "\n";
+    include << "namespace\n";
+    include << "{\n";
+
+    if (!captureLabel.empty())
+    {
+        header << "namespace " << captureLabel << "\n";
+        header << "{\n";
+        out << "namespace " << captureLabel << "\n";
+        out << "{\n";
+    }
+
+    std::stringstream setupCallStream;
+
+    header << "void " << FmtSetupFunction(kNoPartId, kSharedContextId) << ";\n";
+    setupCallStream << "void " << FmtSetupFunction(kNoPartId, kSharedContextId) << "\n";
+    setupCallStream << "{\n";
+
+    WriteCppReplayFunctionWithParts(kSharedContextId, ReplayFunc::Setup, &dataTracker, frameIndex,
+                                    binaryData, setupCalls, include, setupCallStream, out);
+
+    out << setupCallStream.str();
+    out << "}\n";
+    out << "\n";
+
+    if (!captureLabel.empty())
+    {
+        header << "} // namespace " << captureLabel << "\n";
+        out << "} // namespace " << captureLabel << "\n";
+    }
+
+    include << "}  // namespace\n";
+
+    // Write out the source file.
+    {
+        std::string outString    = out.str();
+        std::string headerString = include.str();
+
+        std::string cppFilePath =
+            GetCaptureFilePath(outDir, kSharedContextId, captureLabel, frameIndex, ".cpp");
+
+        SaveFileHelper saveCpp(cppFilePath);
+        saveCpp << headerString << "\n" << outString;
+    }
+
+    // Write out the header file.
+    {
+        std::string headerContents = header.str();
+
+        std::stringstream headerPathStream;
+        headerPathStream << outDir << FmtCapturePrefix(kSharedContextId, captureLabel) << ".h";
+        std::string headerPath = headerPathStream.str();
+
+        SaveFileHelper saveHeader(headerPath);
+        saveHeader << headerContents;
     }
 }
 
@@ -1444,6 +1717,68 @@ bool IsQueryActive(const gl::State &glState, gl::QueryID &queryID)
     }
 
     return false;
+}
+
+bool IsTextureUpdate(CallCapture &call)
+{
+    switch (call.entryPoint)
+    {
+        case EntryPoint::GLCompressedCopyTextureCHROMIUM:
+        case EntryPoint::GLCompressedTexImage1D:
+        case EntryPoint::GLCompressedTexImage2D:
+        case EntryPoint::GLCompressedTexImage2DRobustANGLE:
+        case EntryPoint::GLCompressedTexImage3D:
+        case EntryPoint::GLCompressedTexImage3DOES:
+        case EntryPoint::GLCompressedTexImage3DRobustANGLE:
+        case EntryPoint::GLCompressedTexSubImage1D:
+        case EntryPoint::GLCompressedTexSubImage2D:
+        case EntryPoint::GLCompressedTexSubImage2DRobustANGLE:
+        case EntryPoint::GLCompressedTexSubImage3D:
+        case EntryPoint::GLCompressedTexSubImage3DOES:
+        case EntryPoint::GLCompressedTexSubImage3DRobustANGLE:
+        case EntryPoint::GLCompressedTextureSubImage1D:
+        case EntryPoint::GLCompressedTextureSubImage2D:
+        case EntryPoint::GLCompressedTextureSubImage3D:
+        case EntryPoint::GLCopyTexImage1D:
+        case EntryPoint::GLCopyTexImage2D:
+        case EntryPoint::GLCopyTexSubImage1D:
+        case EntryPoint::GLCopyTexSubImage2D:
+        case EntryPoint::GLCopyTexSubImage3D:
+        case EntryPoint::GLCopyTexSubImage3DOES:
+        case EntryPoint::GLCopyTexture3DANGLE:
+        case EntryPoint::GLCopyTextureCHROMIUM:
+        case EntryPoint::GLCopyTextureSubImage1D:
+        case EntryPoint::GLCopyTextureSubImage2D:
+        case EntryPoint::GLCopyTextureSubImage3D:
+        case EntryPoint::GLTexImage1D:
+        case EntryPoint::GLTexImage2D:
+        case EntryPoint::GLTexImage2DExternalANGLE:
+        case EntryPoint::GLTexImage2DMultisample:
+        case EntryPoint::GLTexImage2DRobustANGLE:
+        case EntryPoint::GLTexImage3D:
+        case EntryPoint::GLTexImage3DMultisample:
+        case EntryPoint::GLTexImage3DOES:
+        case EntryPoint::GLTexImage3DRobustANGLE:
+        case EntryPoint::GLTexSubImage1D:
+        case EntryPoint::GLTexSubImage2D:
+        case EntryPoint::GLTexSubImage2DRobustANGLE:
+        case EntryPoint::GLTexSubImage3D:
+        case EntryPoint::GLTexSubImage3DOES:
+        case EntryPoint::GLTexSubImage3DRobustANGLE:
+        case EntryPoint::GLTextureSubImage1D:
+        case EntryPoint::GLTextureSubImage2D:
+        case EntryPoint::GLTextureSubImage3D:
+            return true;
+
+        // Note: CopyImageSubData is handled specially in copyCompressedTextureData
+        case EntryPoint::GLCopyImageSubData:
+        case EntryPoint::GLCopyImageSubDataEXT:
+        case EntryPoint::GLCopyImageSubDataOES:
+            return false;
+
+        default:
+            return false;
+    }
 }
 
 void Capture(std::vector<CallCapture> *setupCalls, CallCapture &&call)
@@ -1980,21 +2315,24 @@ void CaptureBufferResetCalls(const gl::State &replayState,
                              gl::BufferID *id,
                              const gl::Buffer *buffer)
 {
+    GLuint bufferID = (*id).value;
+
     // Track this as a starting resource that may need to be restored.
-    BufferSet &startingBuffers = resourceTracker->getStartingBuffers();
-    startingBuffers.insert(*id);
+    TrackedResource &trackedBuffers = resourceTracker->getTrackedResource(ResourceIDType::Buffer);
+    ResourceSet &startingBuffers    = trackedBuffers.getStartingResources();
+    startingBuffers.insert(bufferID);
 
     // Track calls to regenerate a given buffer
-    BufferCalls &bufferRegenCalls = resourceTracker->getBufferRegenCalls();
-    Capture(&bufferRegenCalls[*id], CaptureDeleteBuffers(replayState, true, 1, id));
-    Capture(&bufferRegenCalls[*id], CaptureGenBuffers(replayState, true, 1, id));
-    MaybeCaptureUpdateResourceIDs(&bufferRegenCalls[*id]);
+    ResourceCalls &bufferRegenCalls = trackedBuffers.getResourceRegenCalls();
+    Capture(&bufferRegenCalls[bufferID], CaptureDeleteBuffers(replayState, true, 1, id));
+    Capture(&bufferRegenCalls[bufferID], CaptureGenBuffers(replayState, true, 1, id));
+    MaybeCaptureUpdateResourceIDs(&bufferRegenCalls[bufferID]);
 
     // Track calls to restore a given buffer's contents
-    BufferCalls &bufferRestoreCalls = resourceTracker->getBufferRestoreCalls();
-    Capture(&bufferRestoreCalls[*id],
+    ResourceCalls &bufferRestoreCalls = trackedBuffers.getResourceRestoreCalls();
+    Capture(&bufferRestoreCalls[bufferID],
             CaptureBindBuffer(replayState, true, gl::BufferBinding::Array, *id));
-    Capture(&bufferRestoreCalls[*id],
+    Capture(&bufferRestoreCalls[bufferID],
             CaptureBufferData(replayState, true, gl::BufferBinding::Array,
                               static_cast<GLsizeiptr>(buffer->getSize()), buffer->getMapPointer(),
                               buffer->getUsage()));
@@ -2004,25 +2342,25 @@ void CaptureBufferResetCalls(const gl::State &replayState,
         // Track calls to remap a buffer that started as mapped
         BufferCalls &bufferMapCalls = resourceTracker->getBufferMapCalls();
 
-        Capture(&bufferMapCalls[*id],
+        Capture(&bufferMapCalls[bufferID],
                 CaptureBindBuffer(replayState, true, gl::BufferBinding::Array, *id));
 
         void *dontCare = nullptr;
-        Capture(&bufferMapCalls[*id],
+        Capture(&bufferMapCalls[bufferID],
                 CaptureMapBufferRange(replayState, true, gl::BufferBinding::Array,
                                       static_cast<GLsizeiptr>(buffer->getMapOffset()),
                                       static_cast<GLsizeiptr>(buffer->getMapLength()),
                                       buffer->getAccessFlags(), dontCare));
 
         // Track the bufferID that was just mapped
-        bufferMapCalls[*id].back().params.setMappedBufferID(buffer->id());
+        bufferMapCalls[bufferID].back().params.setMappedBufferID(buffer->id());
     }
 
     // Track calls unmap a buffer that started as unmapped
     BufferCalls &bufferUnmapCalls = resourceTracker->getBufferUnmapCalls();
-    Capture(&bufferUnmapCalls[*id],
+    Capture(&bufferUnmapCalls[bufferID],
             CaptureBindBuffer(replayState, true, gl::BufferBinding::Array, *id));
-    Capture(&bufferUnmapCalls[*id],
+    Capture(&bufferUnmapCalls[bufferID],
             CaptureUnmapBuffer(replayState, true, gl::BufferBinding::Array, GL_TRUE));
 }
 
@@ -2096,21 +2434,31 @@ void CaptureDefaultVertexAttribs(const gl::State &replayState,
     }
 }
 
-void CaptureMidExecutionSetup(const gl::Context *context,
-                              std::vector<CallCapture> *setupCalls,
-                              ResourceTracker *resourceTracker,
-                              FrameCapture *frameCapture)
+// Capture the setup of the state that's shared by all of the contexts in the share group:
+// OpenGL ES Version 3.2 (October 22, 2019)
+// Chapter 5 Shared Objects and Multiple Contexts
+//     Objects that can be shared between contexts include buffer objects, program
+//   and shader objects, renderbuffer objects, sampler objects, sync objects, and texture
+//   objects (except for the texture objects named zero).
+//     Objects which contain references to other objects include framebuffer, program
+//   pipeline, transform feedback, and vertex array objects. Such objects are called
+//   container objects and are not shared.
+void CaptureSharedContextMidExecutionSetup(const gl::Context *context,
+                                           std::vector<CallCapture> *setupCalls,
+                                           ResourceTracker *resourceTracker)
 {
-    const gl::State &apiState = context->getState();
+
+    FrameCaptureShared *frameCaptureShared = context->getShareGroup()->getFrameCaptureShared();
+    const gl::State &apiState              = context->getState();
     gl::State replayState(nullptr, nullptr, nullptr, nullptr, nullptr, EGL_OPENGL_ES_API,
                           apiState.getClientVersion(), false, true, true, true, false,
-                          EGL_CONTEXT_PRIORITY_MEDIUM_IMG);
+                          EGL_CONTEXT_PRIORITY_MEDIUM_IMG, apiState.hasProtectedContent());
 
     // Small helper function to make the code more readable.
-    auto cap = [setupCalls](CallCapture &&call) { setupCalls->emplace_back(std::move(call)); };
-
-    // Currently this code assumes we can use create-on-bind. It does not support 'Gen' usage.
-    // TODO(jmadill): Use handle mapping for captured objects. http://anglebug.com/3662
+    auto cap = [frameCaptureShared, setupCalls](CallCapture &&call) {
+        frameCaptureShared->updateReadBufferSize(call.params.getReadBufferSize());
+        setupCalls->emplace_back(std::move(call));
+    };
 
     // Capture Buffer data.
     const gl::BufferManager &buffers = apiState.getBufferManagerForCapture();
@@ -2175,16 +2523,16 @@ void CaptureMidExecutionSetup(const gl::Context *context,
                                           static_cast<GLsizeiptr>(buffer->getMapLength()),
                                           buffer->getAccessFlags(), dontCare));
 
-            frameCapture->getResouceTracker().setStartingBufferMapped(buffer->id(), true);
+            resourceTracker->setStartingBufferMapped(buffer->id().value, true);
 
-            frameCapture->trackBufferMapping(&setupCalls->back(), buffer->id(),
-                                             static_cast<GLsizeiptr>(buffer->getMapOffset()),
-                                             static_cast<GLsizeiptr>(buffer->getMapLength()),
-                                             (buffer->getAccessFlags() & GL_MAP_WRITE_BIT) != 0);
+            frameCaptureShared->trackBufferMapping(
+                &setupCalls->back(), buffer->id(), static_cast<GLsizeiptr>(buffer->getMapOffset()),
+                static_cast<GLsizeiptr>(buffer->getMapLength()),
+                (buffer->getAccessFlags() & GL_MAP_WRITE_BIT) != 0);
         }
         else
         {
-            frameCapture->getResouceTracker().setStartingBufferMapped(buffer->id(), false);
+            resourceTracker->setStartingBufferMapped(buffer->id().value, false);
         }
 
         // Generate the calls needed to restore this buffer to original state for frame looping
@@ -2198,88 +2546,8 @@ void CaptureMidExecutionSetup(const gl::Context *context,
         }
     }
 
-    // Vertex input states. Only handles GLES 2.0 states right now.
-    // Must happen after buffer data initialization.
-    // TODO(http://anglebug.com/3662): Complete state capture.
-
-    // Capture default vertex attribs. Do not capture on GLES1.
-    if (!context->isGLES1())
-    {
-        CaptureDefaultVertexAttribs(replayState, apiState, setupCalls);
-    }
-
-    // Capture vertex array objects
-    const gl::VertexArrayMap &vertexArrayMap = context->getVertexArraysForCapture();
-    gl::VertexArrayID boundVertexArrayID     = {0};
-    for (const auto &vertexArrayIter : vertexArrayMap)
-    {
-        gl::VertexArrayID vertexArrayID = {vertexArrayIter.first};
-        if (vertexArrayID.value != 0)
-        {
-            cap(CaptureGenVertexArrays(replayState, true, 1, &vertexArrayID));
-            MaybeCaptureUpdateResourceIDs(setupCalls);
-        }
-
-        if (vertexArrayIter.second)
-        {
-            const gl::VertexArray *vertexArray = vertexArrayIter.second;
-
-            // Bind the vertexArray (unless default) and populate it
-            if (vertexArrayID.value != 0)
-            {
-                cap(CaptureBindVertexArray(replayState, true, vertexArrayID));
-                boundVertexArrayID = vertexArrayID;
-            }
-            CaptureVertexArrayData(setupCalls, context, vertexArray, &replayState);
-        }
-    }
-
-    // Bind the current vertex array
-    const gl::VertexArray *currentVertexArray = apiState.getVertexArray();
-    if (currentVertexArray->id() != boundVertexArrayID)
-    {
-        cap(CaptureBindVertexArray(replayState, true, currentVertexArray->id()));
-    }
-
-    // Capture indexed buffer bindings.
-    const gl::BufferVector &uniformIndexedBuffers =
-        apiState.getOffsetBindingPointerUniformBuffers();
-    const gl::BufferVector &atomicCounterIndexedBuffers =
-        apiState.getOffsetBindingPointerAtomicCounterBuffers();
-    const gl::BufferVector &shaderStorageIndexedBuffers =
-        apiState.getOffsetBindingPointerShaderStorageBuffers();
-    CaptureIndexedBuffers(replayState, uniformIndexedBuffers, gl::BufferBinding::Uniform,
-                          setupCalls);
-    CaptureIndexedBuffers(replayState, atomicCounterIndexedBuffers,
-                          gl::BufferBinding::AtomicCounter, setupCalls);
-    CaptureIndexedBuffers(replayState, shaderStorageIndexedBuffers,
-                          gl::BufferBinding::ShaderStorage, setupCalls);
-
-    // Capture Buffer bindings.
-    const gl::BoundBufferMap &boundBuffers = apiState.getBoundBuffersForCapture();
-    for (gl::BufferBinding binding : angle::AllEnums<gl::BufferBinding>())
-    {
-        gl::BufferID bufferID = boundBuffers[binding].id();
-
-        // Filter out redundant buffer binding commands. Note that the code in the previous section
-        // only binds to ARRAY_BUFFER. Therefore we only check the array binding against the binding
-        // we set earlier.
-        bool isArray                  = binding == gl::BufferBinding::Array;
-        const gl::Buffer *arrayBuffer = replayState.getArrayBuffer();
-        if ((isArray && arrayBuffer && arrayBuffer->id() != bufferID) ||
-            (!isArray && bufferID.value != 0))
-        {
-            cap(CaptureBindBuffer(replayState, true, binding, bufferID));
-        }
-
-        // Restore all buffer bindings for Reset
-        if (bufferID.value != 0)
-        {
-            CaptureBufferBindingResetCalls(replayState, resourceTracker, binding, bufferID);
-        }
-    }
-
-    // Set a unpack alignment of 1.
+    // Set a unpack alignment of 1. Otherwise, computeRowPitch() will compute the wrong value,
+    // leading to a crash in memcpy() when capturing the texture contents.
     gl::PixelUnpackState &currentUnpackState = replayState.getUnpackState();
     if (currentUnpackState.alignment != 1)
     {
@@ -2288,10 +2556,7 @@ void CaptureMidExecutionSetup(const gl::Context *context,
     }
 
     // Capture Texture setup and data.
-    const gl::TextureManager &textures         = apiState.getTextureManagerForCapture();
-    const gl::TextureBindingMap &boundTextures = apiState.getBoundTexturesForCapture();
-
-    gl::TextureTypeMap<gl::TextureID> currentTextureBindings;
+    const gl::TextureManager &textures = apiState.getTextureManagerForCapture();
 
     for (const auto &textureIter : textures)
     {
@@ -2303,12 +2568,34 @@ void CaptureMidExecutionSetup(const gl::Context *context,
             continue;
         }
 
-        // Gen the Texture.
-        cap(CaptureGenTextures(replayState, true, 1, &id));
-        MaybeCaptureUpdateResourceIDs(setupCalls);
-        cap(CaptureBindTexture(replayState, true, texture->getType(), id));
+        // Track this as a starting resource that may need to be restored.
+        TrackedResource &trackedTextures =
+            resourceTracker->getTrackedResource(ResourceIDType::Texture);
+        ResourceSet &startingTextures = trackedTextures.getStartingResources();
+        startingTextures.insert(id.value);
 
-        currentTextureBindings[texture->getType()] = id;
+        // For the initial texture creation calls, track in the generate list
+        ResourceCalls &textureRegenCalls = trackedTextures.getResourceRegenCalls();
+        CallVector texGenCalls({setupCalls, &textureRegenCalls[id.value]});
+
+        // For reset only, delete the texture before genning
+        Capture(&textureRegenCalls[id.value], CaptureDeleteTextures(replayState, true, 1, &id));
+
+        // Gen the Texture.
+        for (std::vector<CallCapture> *calls : texGenCalls)
+        {
+            Capture(calls, CaptureGenTextures(replayState, true, 1, &id));
+            MaybeCaptureUpdateResourceIDs(calls);
+        }
+
+        // For the remaining texture setup calls, track in the restore list
+        ResourceCalls &textureRestoreCalls = trackedTextures.getResourceRestoreCalls();
+        CallVector texCalls({setupCalls, &textureRestoreCalls[id.value]});
+
+        for (std::vector<CallCapture> *calls : texCalls)
+        {
+            Capture(calls, CaptureBindTexture(replayState, true, texture->getType(), id));
+        }
 
         // Capture sampler parameter states.
         // TODO(jmadill): More sampler / texture states. http://anglebug.com/3662
@@ -2316,12 +2603,20 @@ void CaptureMidExecutionSetup(const gl::Context *context,
             gl::SamplerState::CreateDefaultForTarget(texture->getType());
         const gl::SamplerState &textureSamplerState = texture->getSamplerState();
 
-        auto capTexParam = [cap, &replayState, texture](GLenum pname, GLint param) {
-            cap(CaptureTexParameteri(replayState, true, texture->getType(), pname, param));
+        auto capTexParam = [&replayState, texture, &texCalls](GLenum pname, GLint param) {
+            for (std::vector<CallCapture> *calls : texCalls)
+            {
+                Capture(calls,
+                        CaptureTexParameteri(replayState, true, texture->getType(), pname, param));
+            }
         };
 
-        auto capTexParamf = [cap, &replayState, texture](GLenum pname, GLfloat param) {
-            cap(CaptureTexParameterf(replayState, true, texture->getType(), pname, param));
+        auto capTexParamf = [&replayState, texture, &texCalls](GLenum pname, GLfloat param) {
+            for (std::vector<CallCapture> *calls : texCalls)
+            {
+                Capture(calls,
+                        CaptureTexParameterf(replayState, true, texture->getType(), pname, param));
+            }
         };
 
         if (textureSamplerState.getMinFilter() != defaultSamplerState.getMinFilter())
@@ -2403,7 +2698,10 @@ void CaptureMidExecutionSetup(const gl::Context *context,
         // If the texture is immutable, initialize it with TexStorage
         if (texture->getImmutableFormat())
         {
-            CaptureTextureStorage(setupCalls, &replayState, texture);
+            for (std::vector<CallCapture> *calls : texCalls)
+            {
+                CaptureTextureStorage(calls, &replayState, texture);
+            }
         }
 
         // Iterate texture levels and layers.
@@ -2435,8 +2733,10 @@ void CaptureMidExecutionSetup(const gl::Context *context,
             {
                 // The buffer contents are already backed up, but we need to emit the TexBuffer
                 // binding calls
-                CaptureTextureContents(setupCalls, &replayState, texture, index, desc, 0, 0);
-
+                for (std::vector<CallCapture> *calls : texCalls)
+                {
+                    CaptureTextureContents(calls, &replayState, texture, index, desc, 0, 0);
+                }
                 continue;
             }
 
@@ -2449,9 +2749,12 @@ void CaptureMidExecutionSetup(const gl::Context *context,
                         texture->id(), index.getTarget(), index.getLevelIndex());
 
                 // Use the shadow copy of the data to populate the call
-                CaptureTextureContents(setupCalls, &replayState, texture, index, desc,
-                                       static_cast<GLuint>(capturedTextureLevel.size()),
-                                       capturedTextureLevel.data());
+                for (std::vector<CallCapture> *calls : texCalls)
+                {
+                    CaptureTextureContents(calls, &replayState, texture, index, desc,
+                                           static_cast<GLuint>(capturedTextureLevel.size()),
+                                           capturedTextureLevel.data());
+                }
             }
             else
             {
@@ -2481,57 +2784,27 @@ void CaptureMidExecutionSetup(const gl::Context *context,
                                                index.getLevelIndex(), getFormat, getType,
                                                data.data());
 
-                    CaptureTextureContents(setupCalls, &replayState, texture, index, desc,
-                                           static_cast<GLuint>(data.size()), data.data());
+                    for (std::vector<CallCapture> *calls : texCalls)
+                    {
+                        CaptureTextureContents(calls, &replayState, texture, index, desc,
+                                               static_cast<GLuint>(data.size()), data.data());
+                    }
                 }
                 else
                 {
-                    CaptureTextureContents(setupCalls, &replayState, texture, index, desc, 0,
-                                           nullptr);
+                    for (std::vector<CallCapture> *calls : texCalls)
+                    {
+                        CaptureTextureContents(calls, &replayState, texture, index, desc, 0,
+                                               nullptr);
+                    }
                 }
             }
         }
-    }
-
-    // Set Texture bindings.
-    size_t currentActiveTexture = 0;
-    for (gl::TextureType textureType : angle::AllEnums<gl::TextureType>())
-    {
-        const gl::TextureBindingVector &bindings = boundTextures[textureType];
-        for (size_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex)
-        {
-            gl::TextureID textureID = bindings[bindingIndex].id();
-
-            if (textureID.value != 0)
-            {
-                if (currentActiveTexture != bindingIndex)
-                {
-                    cap(CaptureActiveTexture(replayState, true,
-                                             GL_TEXTURE0 + static_cast<GLenum>(bindingIndex)));
-                    currentActiveTexture = bindingIndex;
-                }
-
-                if (currentTextureBindings[textureType] != textureID)
-                {
-                    cap(CaptureBindTexture(replayState, true, textureType, textureID));
-                    currentTextureBindings[textureType] = textureID;
-                }
-            }
-        }
-    }
-
-    // Set active Texture.
-    size_t stateActiveTexture = apiState.getActiveSampler();
-    if (currentActiveTexture != stateActiveTexture)
-    {
-        cap(CaptureActiveTexture(replayState, true,
-                                 GL_TEXTURE0 + static_cast<GLenum>(stateActiveTexture)));
     }
 
     // Capture Renderbuffers.
     const gl::RenderbufferManager &renderbuffers = apiState.getRenderbufferManagerForCapture();
 
-    gl::RenderbufferID currentRenderbuffer = {0};
     for (const auto &renderbufIter : renderbuffers)
     {
         gl::RenderbufferID id                = {renderbufIter.first};
@@ -2541,8 +2814,6 @@ void CaptureMidExecutionSetup(const gl::Context *context,
         cap(CaptureGenRenderbuffers(replayState, true, 1, &id));
         MaybeCaptureUpdateResourceIDs(setupCalls);
         cap(CaptureBindRenderbuffer(replayState, true, GL_RENDERBUFFER, id));
-
-        currentRenderbuffer = id;
 
         GLenum internalformat = renderbuffer->getFormat().info->internalFormat;
 
@@ -2562,94 +2833,6 @@ void CaptureMidExecutionSetup(const gl::Context *context,
         // TODO(jmadill): Capture renderbuffer contents. http://anglebug.com/3662
     }
 
-    // Set Renderbuffer binding.
-    if (currentRenderbuffer != apiState.getRenderbufferId())
-    {
-        cap(CaptureBindRenderbuffer(replayState, true, GL_RENDERBUFFER,
-                                    apiState.getRenderbufferId()));
-    }
-
-    // Capture Framebuffers.
-    const gl::FramebufferManager &framebuffers = apiState.getFramebufferManagerForCapture();
-
-    gl::FramebufferID currentDrawFramebuffer = {0};
-    gl::FramebufferID currentReadFramebuffer = {0};
-
-    for (const auto &framebufferIter : framebuffers)
-    {
-        gl::FramebufferID id               = {framebufferIter.first};
-        const gl::Framebuffer *framebuffer = framebufferIter.second;
-
-        // The default Framebuffer exists (by default).
-        if (framebuffer->isDefault())
-            continue;
-
-        cap(CaptureGenFramebuffers(replayState, true, 1, &id));
-        MaybeCaptureUpdateResourceIDs(setupCalls);
-        cap(CaptureBindFramebuffer(replayState, true, GL_FRAMEBUFFER, id));
-        currentDrawFramebuffer = currentReadFramebuffer = id;
-
-        // Color Attachments.
-        for (const gl::FramebufferAttachment &colorAttachment : framebuffer->getColorAttachments())
-        {
-            if (!colorAttachment.isAttached())
-            {
-                continue;
-            }
-
-            CaptureFramebufferAttachment(setupCalls, replayState, colorAttachment);
-        }
-
-        const gl::FramebufferAttachment *depthAttachment = framebuffer->getDepthAttachment();
-        if (depthAttachment)
-        {
-            ASSERT(depthAttachment->getBinding() == GL_DEPTH_ATTACHMENT ||
-                   depthAttachment->getBinding() == GL_DEPTH_STENCIL_ATTACHMENT);
-            CaptureFramebufferAttachment(setupCalls, replayState, *depthAttachment);
-        }
-
-        const gl::FramebufferAttachment *stencilAttachment = framebuffer->getStencilAttachment();
-        if (stencilAttachment)
-        {
-            ASSERT(stencilAttachment->getBinding() == GL_STENCIL_ATTACHMENT ||
-                   depthAttachment->getBinding() == GL_DEPTH_STENCIL_ATTACHMENT);
-            CaptureFramebufferAttachment(setupCalls, replayState, *stencilAttachment);
-        }
-
-        const std::vector<GLenum> &drawBufferStates = framebuffer->getDrawBufferStates();
-        cap(CaptureDrawBuffers(replayState, true, static_cast<GLsizei>(drawBufferStates.size()),
-                               drawBufferStates.data()));
-    }
-
-    // Capture framebuffer bindings.
-    gl::FramebufferID stateReadFramebuffer = apiState.getReadFramebuffer()->id();
-    gl::FramebufferID stateDrawFramebuffer = apiState.getDrawFramebuffer()->id();
-    if (stateDrawFramebuffer == stateReadFramebuffer)
-    {
-        if (currentDrawFramebuffer != stateDrawFramebuffer ||
-            currentReadFramebuffer != stateReadFramebuffer)
-        {
-            cap(CaptureBindFramebuffer(replayState, true, GL_FRAMEBUFFER, stateDrawFramebuffer));
-            currentDrawFramebuffer = currentReadFramebuffer = stateDrawFramebuffer;
-        }
-    }
-    else
-    {
-        if (currentDrawFramebuffer != stateDrawFramebuffer)
-        {
-            cap(CaptureBindFramebuffer(replayState, true, GL_DRAW_FRAMEBUFFER,
-                                       currentDrawFramebuffer));
-            currentDrawFramebuffer = stateDrawFramebuffer;
-        }
-
-        if (currentReadFramebuffer != stateReadFramebuffer)
-        {
-            cap(CaptureBindFramebuffer(replayState, true, GL_READ_FRAMEBUFFER,
-                                       replayState.getReadFramebuffer()->id()));
-            currentReadFramebuffer = stateReadFramebuffer;
-        }
-    }
-
     // Capture Shaders and Programs.
     const gl::ShaderProgramManager &shadersAndPrograms =
         apiState.getShaderProgramManagerForCapture();
@@ -2657,8 +2840,6 @@ void CaptureMidExecutionSetup(const gl::Context *context,
         shadersAndPrograms.getShadersForCapture();
     const gl::ResourceMap<gl::Program, gl::ShaderProgramID> &programs =
         shadersAndPrograms.getProgramsForCaptureAndPerf();
-    const gl::ProgramPipelineManager *programPipelineManager =
-        apiState.getProgramPipelineManagerForCapture();
 
     // Capture Program binary state. Use max ID as a temporary shader ID.
     gl::ShaderProgramID tempShaderID = {resourceTracker->getMaxShaderPrograms()};
@@ -2667,7 +2848,8 @@ void CaptureMidExecutionSetup(const gl::Context *context,
         gl::ShaderProgramID id     = {programIter.first};
         const gl::Program *program = programIter.second;
 
-        // Unlinked programs don't have an executable. Thus they don't need to be linked.
+        // Unlinked programs don't have an executable. Thus they don't need to be captured.
+        // Programs are shared by contexts in the share group and only need to be captured once.
         if (!program->isLinked())
         {
             continue;
@@ -2757,37 +2939,9 @@ void CaptureMidExecutionSetup(const gl::Context *context,
         }
 
         resourceTracker->onShaderProgramAccess(id);
-        resourceTracker->getStartingPrograms().insert(id);
-    }
-
-    for (const auto &ppoIterator : *programPipelineManager)
-    {
-        gl::ProgramPipeline *pipeline = ppoIterator.second;
-        gl::ProgramPipelineID id      = {ppoIterator.first};
-        cap(CaptureGenProgramPipelines(replayState, true, 1, &id));
-        MaybeCaptureUpdateResourceIDs(setupCalls);
-
-        // PPOs can contain graphics and compute programs, so loop through all shader types rather
-        // than just the linked ones since getLinkedShaderStages() will return either only graphics
-        // or compute stages.
-        for (gl::ShaderType shaderType : gl::AllShaderTypes())
-        {
-            gl::Program *program = pipeline->getShaderProgram(shaderType);
-            if (!program)
-            {
-                continue;
-            }
-            ASSERT(program->isLinked());
-            GLbitfield gLbitfield = GetBitfieldFromShaderType(shaderType);
-            cap(CaptureUseProgramStages(replayState, true, pipeline->id(), gLbitfield,
-                                        program->id()));
-        }
-
-        gl::Program *program = pipeline->getActiveShaderProgram();
-        if (program)
-        {
-            cap(CaptureActiveShaderProgram(replayState, true, id, program->id()));
-        }
+        resourceTracker->getTrackedResource(ResourceIDType::ShaderProgram)
+            .getStartingResources()
+            .insert(id.value);
     }
 
     // Handle shaders.
@@ -2797,6 +2951,7 @@ void CaptureMidExecutionSetup(const gl::Context *context,
         gl::Shader *shader     = shaderIter.second;
 
         // Skip shaders scheduled for deletion.
+        // Shaders are shared by contexts in the share group and only need to be captured once.
         if (shader->hasBeenDeleted())
         {
             continue;
@@ -2827,6 +2982,366 @@ void CaptureMidExecutionSetup(const gl::Context *context,
         if (sourcePointer && (!shader->isCompiled() || sourcePointer != shaderSource.c_str()))
         {
             cap(CaptureShaderSource(replayState, true, id, 1, &sourcePointer, nullptr));
+        }
+    }
+
+    // Capture Sampler Objects
+    const gl::SamplerManager &samplers = apiState.getSamplerManagerForCapture();
+    for (const auto &samplerIter : samplers)
+    {
+        gl::SamplerID samplerID = {samplerIter.first};
+
+        // Don't gen the sampler if we've seen it before, since they are shared across the context
+        // share group.
+        cap(CaptureGenSamplers(replayState, true, 1, &samplerID));
+        MaybeCaptureUpdateResourceIDs(setupCalls);
+
+        gl::Sampler *sampler = samplerIter.second;
+        if (!sampler)
+        {
+            continue;
+        }
+
+        gl::SamplerState defaultSamplerState;
+        if (sampler->getMinFilter() != defaultSamplerState.getMinFilter())
+        {
+            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_MIN_FILTER,
+                                         sampler->getMinFilter()));
+        }
+        if (sampler->getMagFilter() != defaultSamplerState.getMagFilter())
+        {
+            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_MAG_FILTER,
+                                         sampler->getMagFilter()));
+        }
+        if (sampler->getWrapS() != defaultSamplerState.getWrapS())
+        {
+            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_WRAP_S,
+                                         sampler->getWrapS()));
+        }
+        if (sampler->getWrapR() != defaultSamplerState.getWrapR())
+        {
+            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_WRAP_R,
+                                         sampler->getWrapR()));
+        }
+        if (sampler->getWrapT() != defaultSamplerState.getWrapT())
+        {
+            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_WRAP_T,
+                                         sampler->getWrapT()));
+        }
+        if (sampler->getMinLod() != defaultSamplerState.getMinLod())
+        {
+            cap(CaptureSamplerParameterf(replayState, true, samplerID, GL_TEXTURE_MIN_LOD,
+                                         sampler->getMinLod()));
+        }
+        if (sampler->getMaxLod() != defaultSamplerState.getMaxLod())
+        {
+            cap(CaptureSamplerParameterf(replayState, true, samplerID, GL_TEXTURE_MAX_LOD,
+                                         sampler->getMaxLod()));
+        }
+        if (sampler->getCompareMode() != defaultSamplerState.getCompareMode())
+        {
+            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_COMPARE_MODE,
+                                         sampler->getCompareMode()));
+        }
+        if (sampler->getCompareFunc() != defaultSamplerState.getCompareFunc())
+        {
+            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_COMPARE_FUNC,
+                                         sampler->getCompareFunc()));
+        }
+    }
+
+    // Capture Sync Objects
+    const gl::SyncManager &syncs = apiState.getSyncManagerForCapture();
+    for (const auto &syncIter : syncs)
+    {
+        GLsync syncID        = gl::bitCast<GLsync>(static_cast<size_t>(syncIter.first));
+        const gl::Sync *sync = syncIter.second;
+
+        if (!sync)
+        {
+            continue;
+        }
+        cap(CaptureFenceSync(replayState, true, sync->getCondition(), sync->getFlags(), syncID));
+        CaptureFenceSyncResetCalls(replayState, resourceTracker, syncID, sync);
+        resourceTracker->getStartingFenceSyncs().insert(syncID);
+    }
+
+    // Allow the replayState object to be destroyed conveniently.
+    replayState.setBufferBinding(context, gl::BufferBinding::Array, nullptr);
+}
+
+void CaptureMidExecutionSetup(const gl::Context *context,
+                              std::vector<CallCapture> *setupCalls,
+                              ResourceTracker *resourceTracker)
+{
+    const gl::State &apiState = context->getState();
+    gl::State replayState(nullptr, nullptr, nullptr, nullptr, nullptr, EGL_OPENGL_ES_API,
+                          context->getState().getClientVersion(), false, true, true, true, false,
+                          EGL_CONTEXT_PRIORITY_MEDIUM_IMG, apiState.hasProtectedContent());
+
+    // Small helper function to make the code more readable.
+    auto cap = [setupCalls](CallCapture &&call) { setupCalls->emplace_back(std::move(call)); };
+
+    // Currently this code assumes we can use create-on-bind. It does not support 'Gen' usage.
+    // TODO(jmadill): Use handle mapping for captured objects. http://anglebug.com/3662
+
+    // Vertex input states. Only handles GLES 2.0 states right now.
+    // Must happen after buffer data initialization.
+    // TODO(http://anglebug.com/3662): Complete state capture.
+
+    // Capture default vertex attribs. Do not capture on GLES1.
+    if (!context->isGLES1())
+    {
+        CaptureDefaultVertexAttribs(replayState, apiState, setupCalls);
+    }
+
+    // Capture vertex array objects
+    const gl::VertexArrayMap &vertexArrayMap = context->getVertexArraysForCapture();
+    gl::VertexArrayID boundVertexArrayID     = {0};
+    for (const auto &vertexArrayIter : vertexArrayMap)
+    {
+        gl::VertexArrayID vertexArrayID = {vertexArrayIter.first};
+        if (vertexArrayID.value != 0)
+        {
+            cap(CaptureGenVertexArrays(replayState, true, 1, &vertexArrayID));
+            MaybeCaptureUpdateResourceIDs(setupCalls);
+        }
+
+        if (vertexArrayIter.second)
+        {
+            const gl::VertexArray *vertexArray = vertexArrayIter.second;
+
+            // Bind the vertexArray (unless default) and populate it
+            if (vertexArrayID.value != 0)
+            {
+                cap(CaptureBindVertexArray(replayState, true, vertexArrayID));
+                boundVertexArrayID = vertexArrayID;
+            }
+            CaptureVertexArrayData(setupCalls, context, vertexArray, &replayState);
+        }
+    }
+
+    // Bind the current vertex array
+    const gl::VertexArray *currentVertexArray = apiState.getVertexArray();
+    if (currentVertexArray->id() != boundVertexArrayID)
+    {
+        cap(CaptureBindVertexArray(replayState, true, currentVertexArray->id()));
+    }
+
+    // Capture indexed buffer bindings.
+    const gl::BufferVector &uniformIndexedBuffers =
+        apiState.getOffsetBindingPointerUniformBuffers();
+    const gl::BufferVector &atomicCounterIndexedBuffers =
+        apiState.getOffsetBindingPointerAtomicCounterBuffers();
+    const gl::BufferVector &shaderStorageIndexedBuffers =
+        apiState.getOffsetBindingPointerShaderStorageBuffers();
+    CaptureIndexedBuffers(replayState, uniformIndexedBuffers, gl::BufferBinding::Uniform,
+                          setupCalls);
+    CaptureIndexedBuffers(replayState, atomicCounterIndexedBuffers,
+                          gl::BufferBinding::AtomicCounter, setupCalls);
+    CaptureIndexedBuffers(replayState, shaderStorageIndexedBuffers,
+                          gl::BufferBinding::ShaderStorage, setupCalls);
+
+    // Capture Buffer bindings.
+    const gl::BoundBufferMap &boundBuffers = apiState.getBoundBuffersForCapture();
+    for (gl::BufferBinding binding : angle::AllEnums<gl::BufferBinding>())
+    {
+        gl::BufferID bufferID = boundBuffers[binding].id();
+
+        // Filter out redundant buffer binding commands. Note that the code in the previous section
+        // only binds to ARRAY_BUFFER. Therefore we only check the array binding against the binding
+        // we set earlier.
+        bool isArray                  = binding == gl::BufferBinding::Array;
+        const gl::Buffer *arrayBuffer = replayState.getArrayBuffer();
+        if ((isArray && arrayBuffer && arrayBuffer->id() != bufferID) ||
+            (!isArray && bufferID.value != 0))
+        {
+            cap(CaptureBindBuffer(replayState, true, binding, bufferID));
+        }
+
+        // Restore all buffer bindings for Reset
+        if (bufferID.value != 0)
+        {
+            CaptureBufferBindingResetCalls(replayState, resourceTracker, binding, bufferID);
+        }
+    }
+
+    // Set a unpack alignment of 1. Otherwise, computeRowPitch() will compute the wrong value,
+    // leading to a crash in memcpy() when capturing the texture contents.
+    gl::PixelUnpackState &currentUnpackState = replayState.getUnpackState();
+    if (currentUnpackState.alignment != 1)
+    {
+        cap(CapturePixelStorei(replayState, true, GL_UNPACK_ALIGNMENT, 1));
+        currentUnpackState.alignment = 1;
+    }
+
+    // Capture Texture setup and data.
+    const gl::TextureBindingMap &boundTextures = apiState.getBoundTexturesForCapture();
+
+    // Set Texture bindings.
+    size_t currentActiveTexture = 0;
+    gl::TextureTypeMap<gl::TextureID> currentTextureBindings;
+    for (gl::TextureType textureType : angle::AllEnums<gl::TextureType>())
+    {
+        const gl::TextureBindingVector &bindings = boundTextures[textureType];
+        for (size_t bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex)
+        {
+            gl::TextureID textureID = bindings[bindingIndex].id();
+
+            if (textureID.value != 0)
+            {
+                if (currentActiveTexture != bindingIndex)
+                {
+                    cap(CaptureActiveTexture(replayState, true,
+                                             GL_TEXTURE0 + static_cast<GLenum>(bindingIndex)));
+                    currentActiveTexture = bindingIndex;
+                }
+
+                if (currentTextureBindings[textureType] != textureID)
+                {
+                    cap(CaptureBindTexture(replayState, true, textureType, textureID));
+                    currentTextureBindings[textureType] = textureID;
+                }
+            }
+        }
+    }
+
+    // Set active Texture.
+    size_t stateActiveTexture = apiState.getActiveSampler();
+    if (currentActiveTexture != stateActiveTexture)
+    {
+        cap(CaptureActiveTexture(replayState, true,
+                                 GL_TEXTURE0 + static_cast<GLenum>(stateActiveTexture)));
+    }
+
+    // Set Renderbuffer binding.
+    const gl::RenderbufferManager &renderbuffers = apiState.getRenderbufferManagerForCapture();
+    gl::RenderbufferID currentRenderbuffer       = {0};
+    for (const auto &renderbufIter : renderbuffers)
+    {
+        currentRenderbuffer = renderbufIter.second->id();
+    }
+
+    if (currentRenderbuffer != apiState.getRenderbufferId())
+    {
+        cap(CaptureBindRenderbuffer(replayState, true, GL_RENDERBUFFER,
+                                    apiState.getRenderbufferId()));
+    }
+
+    // Capture Framebuffers.
+    const gl::FramebufferManager &framebuffers = apiState.getFramebufferManagerForCapture();
+
+    gl::FramebufferID currentDrawFramebuffer = {0};
+    gl::FramebufferID currentReadFramebuffer = {0};
+
+    for (const auto &framebufferIter : framebuffers)
+    {
+        gl::FramebufferID id               = {framebufferIter.first};
+        const gl::Framebuffer *framebuffer = framebufferIter.second;
+
+        // The default Framebuffer exists (by default).
+        if (framebuffer->isDefault())
+        {
+            continue;
+        }
+
+        cap(CaptureGenFramebuffers(replayState, true, 1, &id));
+        MaybeCaptureUpdateResourceIDs(setupCalls);
+        cap(CaptureBindFramebuffer(replayState, true, GL_FRAMEBUFFER, id));
+        currentDrawFramebuffer = currentReadFramebuffer = id;
+
+        // Color Attachments.
+        for (const gl::FramebufferAttachment &colorAttachment : framebuffer->getColorAttachments())
+        {
+            if (!colorAttachment.isAttached())
+            {
+                continue;
+            }
+
+            CaptureFramebufferAttachment(setupCalls, replayState, colorAttachment);
+        }
+
+        const gl::FramebufferAttachment *depthAttachment = framebuffer->getDepthAttachment();
+        if (depthAttachment)
+        {
+            ASSERT(depthAttachment->getBinding() == GL_DEPTH_ATTACHMENT ||
+                   depthAttachment->getBinding() == GL_DEPTH_STENCIL_ATTACHMENT);
+            CaptureFramebufferAttachment(setupCalls, replayState, *depthAttachment);
+        }
+
+        const gl::FramebufferAttachment *stencilAttachment = framebuffer->getStencilAttachment();
+        if (stencilAttachment)
+        {
+            ASSERT(stencilAttachment->getBinding() == GL_STENCIL_ATTACHMENT ||
+                   depthAttachment->getBinding() == GL_DEPTH_STENCIL_ATTACHMENT);
+            CaptureFramebufferAttachment(setupCalls, replayState, *stencilAttachment);
+        }
+
+        const std::vector<GLenum> &drawBufferStates = framebuffer->getDrawBufferStates();
+        cap(CaptureDrawBuffers(replayState, true, static_cast<GLsizei>(drawBufferStates.size()),
+                               drawBufferStates.data()));
+    }
+
+    // Capture framebuffer bindings.
+    gl::FramebufferID stateReadFramebuffer = apiState.getReadFramebuffer()->id();
+    gl::FramebufferID stateDrawFramebuffer = apiState.getDrawFramebuffer()->id();
+    if (stateDrawFramebuffer == stateReadFramebuffer)
+    {
+        if (currentDrawFramebuffer != stateDrawFramebuffer ||
+            currentReadFramebuffer != stateReadFramebuffer)
+        {
+            cap(CaptureBindFramebuffer(replayState, true, GL_FRAMEBUFFER, stateDrawFramebuffer));
+            currentDrawFramebuffer = currentReadFramebuffer = stateDrawFramebuffer;
+        }
+    }
+    else
+    {
+        if (currentDrawFramebuffer != stateDrawFramebuffer)
+        {
+            cap(CaptureBindFramebuffer(replayState, true, GL_DRAW_FRAMEBUFFER,
+                                       currentDrawFramebuffer));
+            currentDrawFramebuffer = stateDrawFramebuffer;
+        }
+
+        if (currentReadFramebuffer != stateReadFramebuffer)
+        {
+            cap(CaptureBindFramebuffer(replayState, true, GL_READ_FRAMEBUFFER,
+                                       replayState.getReadFramebuffer()->id()));
+            currentReadFramebuffer = stateReadFramebuffer;
+        }
+    }
+
+    // Capture Program Pipelines
+    const gl::ProgramPipelineManager *programPipelineManager =
+        apiState.getProgramPipelineManagerForCapture();
+
+    for (const auto &ppoIterator : *programPipelineManager)
+    {
+        gl::ProgramPipeline *pipeline = ppoIterator.second;
+        gl::ProgramPipelineID id      = {ppoIterator.first};
+        cap(CaptureGenProgramPipelines(replayState, true, 1, &id));
+        MaybeCaptureUpdateResourceIDs(setupCalls);
+
+        // PPOs can contain graphics and compute programs, so loop through all shader types rather
+        // than just the linked ones since getLinkedShaderStages() will return either only graphics
+        // or compute stages.
+        for (gl::ShaderType shaderType : gl::AllShaderTypes())
+        {
+            gl::Program *program = pipeline->getShaderProgram(shaderType);
+            if (!program)
+            {
+                continue;
+            }
+            ASSERT(program->isLinked());
+            GLbitfield gLbitfield = GetBitfieldFromShaderType(shaderType);
+            cap(CaptureUseProgramStages(replayState, true, pipeline->id(), gLbitfield,
+                                        program->id()));
+        }
+
+        gl::Program *program = pipeline->getActiveShaderProgram();
+        if (program)
+        {
+            cap(CaptureActiveShaderProgram(replayState, true, id, program->id()));
         }
     }
 
@@ -2932,68 +3447,6 @@ void CaptureMidExecutionSetup(const gl::Context *context,
                                          currentXFB->id()));
     }
 
-    // Capture Sampler Objects
-    const gl::SamplerManager &samplers = apiState.getSamplerManagerForCapture();
-    for (const auto &samplerIter : samplers)
-    {
-        gl::SamplerID samplerID = {samplerIter.first};
-        cap(CaptureGenSamplers(replayState, true, 1, &samplerID));
-        MaybeCaptureUpdateResourceIDs(setupCalls);
-
-        gl::Sampler *sampler = samplerIter.second;
-        if (!sampler)
-        {
-            continue;
-        }
-
-        gl::SamplerState defaultSamplerState;
-        if (sampler->getMinFilter() != defaultSamplerState.getMinFilter())
-        {
-            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_MIN_FILTER,
-                                         sampler->getMinFilter()));
-        }
-        if (sampler->getMagFilter() != defaultSamplerState.getMagFilter())
-        {
-            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_MAG_FILTER,
-                                         sampler->getMagFilter()));
-        }
-        if (sampler->getWrapS() != defaultSamplerState.getWrapS())
-        {
-            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_WRAP_S,
-                                         sampler->getWrapS()));
-        }
-        if (sampler->getWrapR() != defaultSamplerState.getWrapR())
-        {
-            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_WRAP_R,
-                                         sampler->getWrapR()));
-        }
-        if (sampler->getWrapT() != defaultSamplerState.getWrapT())
-        {
-            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_WRAP_T,
-                                         sampler->getWrapT()));
-        }
-        if (sampler->getMinLod() != defaultSamplerState.getMinLod())
-        {
-            cap(CaptureSamplerParameterf(replayState, true, samplerID, GL_TEXTURE_MIN_LOD,
-                                         sampler->getMinLod()));
-        }
-        if (sampler->getMaxLod() != defaultSamplerState.getMaxLod())
-        {
-            cap(CaptureSamplerParameterf(replayState, true, samplerID, GL_TEXTURE_MAX_LOD,
-                                         sampler->getMaxLod()));
-        }
-        if (sampler->getCompareMode() != defaultSamplerState.getCompareMode())
-        {
-            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_COMPARE_MODE,
-                                         sampler->getCompareMode()));
-        }
-        if (sampler->getCompareFunc() != defaultSamplerState.getCompareFunc())
-        {
-            cap(CaptureSamplerParameteri(replayState, true, samplerID, GL_TEXTURE_COMPARE_FUNC,
-                                         sampler->getCompareFunc()));
-        }
-    }
-
     // Bind samplers
     const gl::SamplerBindingVector &samplerBindings = apiState.getSamplers();
     for (GLuint bindingIndex = 0; bindingIndex < static_cast<GLuint>(samplerBindings.size());
@@ -3004,22 +3457,6 @@ void CaptureMidExecutionSetup(const gl::Context *context,
         {
             cap(CaptureBindSampler(replayState, true, bindingIndex, samplerID));
         }
-    }
-
-    // Capture Sync Objects
-    const gl::SyncManager &syncs = apiState.getSyncManagerForCapture();
-    for (const auto &syncIter : syncs)
-    {
-        GLsync syncID        = gl::bitCast<GLsync>(static_cast<size_t>(syncIter.first));
-        const gl::Sync *sync = syncIter.second;
-
-        if (!sync)
-        {
-            continue;
-        }
-        cap(CaptureFenceSync(replayState, true, sync->getCondition(), sync->getFlags(), syncID));
-        CaptureFenceSyncResetCalls(replayState, resourceTracker, syncID, sync);
-        resourceTracker->getStartingFenceSyncs().insert(syncID);
     }
 
     // Capture Image Texture bindings
@@ -3060,6 +3497,28 @@ void CaptureMidExecutionSetup(const gl::Context *context,
         if (currentTextureState != defaultTextureState)
         {
             capCap(GL_TEXTURE_2D, currentTextureState);
+        }
+
+        cap(CaptureMatrixMode(replayState, true, gl::MatrixType::Projection));
+        for (angle::Mat4 projectionMatrix :
+             apiState.gles1().getMatrixStack(gl::MatrixType::Projection))
+        {
+            cap(CapturePushMatrix(replayState, true));
+            cap(CaptureLoadMatrixf(replayState, true, projectionMatrix.elements().data()));
+        }
+
+        cap(CaptureMatrixMode(replayState, true, gl::MatrixType::Modelview));
+        for (angle::Mat4 modelViewMatrix :
+             apiState.gles1().getMatrixStack(gl::MatrixType::Modelview))
+        {
+            cap(CapturePushMatrix(replayState, true));
+            cap(CaptureLoadMatrixf(replayState, true, modelViewMatrix.elements().data()));
+        }
+
+        gl::MatrixType currentMatrixMode = apiState.gles1().getMatrixMode();
+        if (currentMatrixMode != gl::MatrixType::Modelview)
+        {
+            cap(CaptureMatrixMode(replayState, true, currentMatrixMode));
         }
     }
 
@@ -3487,6 +3946,7 @@ ParamCapture &ParamCapture::operator=(ParamCapture &&other)
     std::swap(data, other.data);
     std::swap(arrayClientPointerIndex, other.arrayClientPointerIndex);
     std::swap(readBufferSizeBytes, other.readBufferSizeBytes);
+    std::swap(dataNElements, other.dataNElements);
     return *this;
 }
 
@@ -3615,7 +4075,15 @@ ReplayContext::ReplayContext(size_t readBufferSizebytes,
 }
 ReplayContext::~ReplayContext() {}
 
-FrameCapture::FrameCapture()
+FrameCapture::FrameCapture()  = default;
+FrameCapture::~FrameCapture() = default;
+
+void FrameCapture::reset()
+{
+    mSetupCalls.clear();
+}
+
+FrameCaptureShared::FrameCaptureShared()
     : mEnabled(true),
       mSerializeStateEnabled(false),
       mCompression(true),
@@ -3626,7 +4094,8 @@ FrameCapture::FrameCapture()
       mClientArraySizes{},
       mReadBufferSize(0),
       mHasResourceType{},
-      mCaptureTrigger(0)
+      mCaptureTrigger(0),
+      mWindowSurfaceContextID({0})
 {
     reset();
 
@@ -3702,21 +4171,34 @@ FrameCapture::FrameCapture()
     }
 }
 
-FrameCapture::~FrameCapture() = default;
+FrameCaptureShared::~FrameCaptureShared() = default;
 
-void FrameCapture::copyCompressedTextureData(const gl::Context *context, const CallCapture &call)
+void FrameCaptureShared::copyCompressedTextureData(const gl::Context *context,
+                                                   const CallCapture &call)
 {
     // For compressed textures, we need to copy the source data that was already captured into a new
     // cached texture entry for use during mid-execution capture, rather than reading it back with
     // ANGLE_get_image.
 
-    GLuint srcName = call.params.getParam("srcName", ParamType::TGLuint, 0).value.GLuintVal;
+    GLenum srcTarget = call.params.getParam("srcTarget", ParamType::TGLenum, 1).value.GLenumVal;
+    GLenum dstTarget = call.params.getParam("dstTarget", ParamType::TGLenum, 7).value.GLenumVal;
+
+    // TODO(anglebug.com/6104): Type of incoming ID varies based on target type, but we're only
+    // handling textures for now. If either of these asserts fire, then we need to add renderbuffer
+    // support.
+    ASSERT(srcTarget == GL_TEXTURE_2D || srcTarget == GL_TEXTURE_2D_ARRAY ||
+           srcTarget == GL_TEXTURE_3D || srcTarget == GL_TEXTURE_CUBE_MAP);
+    ASSERT(dstTarget == GL_TEXTURE_2D || dstTarget == GL_TEXTURE_2D_ARRAY ||
+           dstTarget == GL_TEXTURE_3D || dstTarget == GL_TEXTURE_CUBE_MAP);
+
+    gl::TextureID srcName =
+        call.params.getParam("srcName", ParamType::TTextureID, 0).value.TextureIDVal;
     GLint srcLevel = call.params.getParam("srcLevel", ParamType::TGLint, 2).value.GLintVal;
-    GLuint dstName = call.params.getParam("dstName", ParamType::TGLuint, 6).value.GLuintVal;
+    gl::TextureID dstName =
+        call.params.getParam("dstName", ParamType::TTextureID, 6).value.TextureIDVal;
     GLint dstLevel = call.params.getParam("dstLevel", ParamType::TGLint, 8).value.GLintVal;
 
     // Look up the texture type
-    GLenum dstTarget = call.params.getParam("dstTarget", ParamType::TGLenum, 7).value.GLenumVal;
     gl::TextureTarget dstTargetPacked = gl::PackParam<gl::TextureTarget>(dstTarget);
     gl::TextureType dstTextureType    = gl::TextureTargetToType(dstTargetPacked);
 
@@ -3729,11 +4211,15 @@ void FrameCapture::copyCompressedTextureData(const gl::Context *context, const C
     if (dstFormat.compressed)
     {
         context->getShareGroup()->getFrameCaptureShared()->copyCachedTextureLevel(
-            context, {srcName}, srcLevel, {dstName}, dstLevel, call);
+            context, srcName, srcLevel, dstName, dstLevel, call);
     }
+
+    // Also track that the destination texture has been updated
+    mResourceTracker.getTrackedResource(ResourceIDType::Texture).setModifiedResource(dstName.value);
 }
 
-void FrameCapture::captureCompressedTextureData(const gl::Context *context, const CallCapture &call)
+void FrameCaptureShared::captureCompressedTextureData(const gl::Context *context,
+                                                      const CallCapture &call)
 {
     // For compressed textures, track a shadow copy of the data
     // for use during mid-execution capture, rather than reading it back
@@ -3924,14 +4410,14 @@ void FrameCapture::captureCompressedTextureData(const gl::Context *context, cons
     }
 }
 
-void FrameCapture::trackBufferMapping(CallCapture *call,
-                                      gl::BufferID id,
-                                      GLintptr offset,
-                                      GLsizeiptr length,
-                                      bool writable)
+void FrameCaptureShared::trackBufferMapping(CallCapture *call,
+                                            gl::BufferID id,
+                                            GLintptr offset,
+                                            GLsizeiptr length,
+                                            bool writable)
 {
     // Track that the buffer was mapped
-    mResourceTracker.setBufferMapped(id);
+    mResourceTracker.setBufferMapped(id.value);
 
     if (writable)
     {
@@ -3941,14 +4427,121 @@ void FrameCapture::trackBufferMapping(CallCapture *call,
         mBufferDataMap[id] = std::make_pair(offset, length);
 
         // Track that this buffer was potentially modified
-        mResourceTracker.setBufferModified(id);
+        mResourceTracker.getTrackedResource(ResourceIDType::Buffer).setModifiedResource(id.value);
 
         // Track the bufferID that was just mapped for use when writing return value
         call->params.setMappedBufferID(id);
     }
 }
 
-void FrameCapture::maybeOverrideEntryPoint(const gl::Context *context, CallCapture &call)
+void FrameCaptureShared::trackTextureUpdate(const gl::Context *context, const CallCapture &call)
+{
+    int index             = 0;
+    std::string paramName = "targetPacked";
+
+    // Some calls provide the textureID directly
+    switch (call.entryPoint)
+    {
+        case EntryPoint::GLCompressedCopyTextureCHROMIUM:
+            index     = 1;
+            paramName = "destIdPacked";
+            break;
+        case EntryPoint::GLCopyTextureCHROMIUM:
+        case EntryPoint::GLCopySubTextureCHROMIUM:
+            index     = 3;
+            paramName = "destIdPacked";
+            break;
+        default:
+            break;
+    }
+
+    // For the rest, look it up based on the currently bound texture
+    GLuint id = 0;
+    if (index == 0)
+    {
+        gl::TextureTarget targetPacked =
+            call.params.getParam(paramName.c_str(), ParamType::TTextureTarget, index)
+                .value.TextureTargetVal;
+        gl::TextureType textureType = gl::TextureTargetToType(targetPacked);
+        gl::Texture *texture        = context->getState().getTargetTexture(textureType);
+        id                          = texture->id().value;
+    }
+    else
+    {
+        gl::TextureID destIDPacked =
+            call.params.getParam(paramName.c_str(), ParamType::TTextureID, index)
+                .value.TextureIDVal;
+        id = destIDPacked.value;
+    }
+
+    // Mark it as modified
+    mResourceTracker.getTrackedResource(ResourceIDType::Texture).setModifiedResource(id);
+}
+
+void FrameCaptureShared::updateCopyImageSubData(CallCapture &call)
+{
+    // This call modifies srcName and dstName to no longer be object IDs (GLuint), but actual
+    // packed types that can remapped using gTextureMap and gRenderbufferMap
+
+    GLint srcName    = call.params.getParam("srcName", ParamType::TGLuint, 0).value.GLuintVal;
+    GLenum srcTarget = call.params.getParam("srcTarget", ParamType::TGLenum, 1).value.GLenumVal;
+    switch (srcTarget)
+    {
+        case GL_RENDERBUFFER:
+        {
+            // Convert the GLuint to RenderbufferID
+            gl::RenderbufferID srcRenderbufferID = {static_cast<GLuint>(srcName)};
+            call.params.setValueParamAtIndex("srcName", ParamType::TRenderbufferID,
+                                             srcRenderbufferID, 0);
+            break;
+        }
+        case GL_TEXTURE_2D:
+        case GL_TEXTURE_2D_ARRAY:
+        case GL_TEXTURE_3D:
+        case GL_TEXTURE_CUBE_MAP:
+        {
+            // Convert the GLuint to TextureID
+            gl::TextureID srcTextureID = {static_cast<GLuint>(srcName)};
+            call.params.setValueParamAtIndex("srcName", ParamType::TTextureID, srcTextureID, 0);
+            break;
+        }
+        default:
+            ERR() << "Unhandled srcTarget = " << srcTarget;
+            UNREACHABLE();
+            break;
+    }
+
+    // Change dstName to the appropriate type based on dstTarget
+    GLint dstName    = call.params.getParam("dstName", ParamType::TGLuint, 6).value.GLuintVal;
+    GLenum dstTarget = call.params.getParam("dstTarget", ParamType::TGLenum, 7).value.GLenumVal;
+    switch (dstTarget)
+    {
+        case GL_RENDERBUFFER:
+        {
+            // Convert the GLuint to RenderbufferID
+            gl::RenderbufferID dstRenderbufferID = {static_cast<GLuint>(dstName)};
+            call.params.setValueParamAtIndex("dstName", ParamType::TRenderbufferID,
+                                             dstRenderbufferID, 6);
+            break;
+        }
+        case GL_TEXTURE_2D:
+        case GL_TEXTURE_2D_ARRAY:
+        case GL_TEXTURE_3D:
+        case GL_TEXTURE_CUBE_MAP:
+        {
+            // Convert the GLuint to TextureID
+            gl::TextureID dstTextureID = {static_cast<GLuint>(dstName)};
+            call.params.setValueParamAtIndex("dstName", ParamType::TTextureID, dstTextureID, 6);
+            break;
+        }
+        default:
+            ERR() << "Unhandled dstTarget = " << dstTarget;
+            UNREACHABLE();
+            break;
+    }
+}
+
+void FrameCaptureShared::maybeOverrideEntryPoint(const gl::Context *context, CallCapture &call)
 {
     switch (call.entryPoint)
     {
@@ -3966,14 +4559,22 @@ void FrameCapture::maybeOverrideEntryPoint(const gl::Context *context, CallCaptu
             UNIMPLEMENTED();
             break;
         }
+        case EntryPoint::GLCopyImageSubData:
+        case EntryPoint::GLCopyImageSubDataEXT:
+        case EntryPoint::GLCopyImageSubDataOES:
+        {
+            // We must look at the src and dst target types to determine which remap table to use
+            updateCopyImageSubData(call);
+            break;
+        }
         default:
             break;
     }
 }
 
-void FrameCapture::maybeCaptureDrawArraysClientData(const gl::Context *context,
-                                                    CallCapture &call,
-                                                    size_t instanceCount)
+void FrameCaptureShared::maybeCaptureDrawArraysClientData(const gl::Context *context,
+                                                          CallCapture &call,
+                                                          size_t instanceCount)
 {
     if (!context->getStateCache().hasAnyActiveClientAttrib())
     {
@@ -3987,16 +4588,23 @@ void FrameCapture::maybeCaptureDrawArraysClientData(const gl::Context *context,
     captureClientArraySnapshot(context, firstVertex + drawCount, instanceCount);
 }
 
-void FrameCapture::maybeCaptureDrawElementsClientData(const gl::Context *context,
-                                                      CallCapture &call,
-                                                      size_t instanceCount)
+void FrameCaptureShared::maybeCaptureDrawElementsClientData(const gl::Context *context,
+                                                            CallCapture &call,
+                                                            size_t instanceCount)
 {
     if (!context->getStateCache().hasAnyActiveClientAttrib())
     {
         return;
     }
 
+    // if the count is zero then the index evaluation is not valid and we wouldn't be drawing
+    // anything anyway, so skip capturing
     GLsizei count = call.params.getParam("count", ParamType::TGLsizei, 1).value.GLsizeiVal;
+    if (count == 0)
+    {
+        return;
+    }
+
     gl::DrawElementsType drawElementsType =
         call.params.getParam("typePacked", ParamType::TDrawElementsType, 2)
             .value.DrawElementsTypeVal;
@@ -4016,6 +4624,7 @@ void FrameCapture::maybeCaptureDrawElementsClientData(const gl::Context *context
     }
     else
     {
+        ASSERT(indices);
         indexRange = gl::ComputeIndexRange(drawElementsType, indices, count, restart);
     }
 
@@ -4023,7 +4632,7 @@ void FrameCapture::maybeCaptureDrawElementsClientData(const gl::Context *context
     captureClientArraySnapshot(context, indexRange.end + 1, instanceCount);
 }
 
-void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCapture &call)
+void FrameCaptureShared::maybeCapturePreCallUpdates(const gl::Context *context, CallCapture &call)
 {
     switch (call.entryPoint)
     {
@@ -4078,12 +4687,33 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
             break;
         }
 
+        case EntryPoint::GLGenTextures:
+        {
+            GLsizei count = call.params.getParam("n", ParamType::TGLsizei, 0).value.GLsizeiVal;
+            const gl::TextureID *textureIDs =
+                call.params.getParam("texturesPacked", ParamType::TTextureIDPointer, 1)
+                    .value.TextureIDPointerVal;
+            for (GLsizei i = 0; i < count; i++)
+            {
+                // If we're capturing, track what new textures have been genned
+                if (isCaptureActive())
+                {
+                    mResourceTracker.getTrackedResource(ResourceIDType::Texture)
+                        .setGennedResource(textureIDs[i].value);
+                }
+            }
+            break;
+        }
+
         case EntryPoint::GLDeleteBuffers:
         {
             GLsizei count = call.params.getParam("n", ParamType::TGLsizei, 0).value.GLsizeiVal;
             const gl::BufferID *bufferIDs =
                 call.params.getParam("buffersPacked", ParamType::TBufferIDConstPointer, 1)
                     .value.BufferIDConstPointerVal;
+            FrameCaptureShared *frameCaptureShared =
+                context->getShareGroup()->getFrameCaptureShared();
+            ResourceTracker &resourceTracker = context->getFrameCaptureSharedResourceTracker();
             for (GLsizei i = 0; i < count; i++)
             {
                 // For each buffer being deleted, check our backup of data and remove it
@@ -4093,9 +4723,10 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
                     mBufferDataMap.erase(bufferDataInfo);
                 }
                 // If we're capturing, track what buffers have been deleted
-                if (isCaptureActive())
+                if (frameCaptureShared->isCaptureActive())
                 {
-                    mResourceTracker.setDeletedBuffer(bufferIDs[i]);
+                    resourceTracker.getTrackedResource(ResourceIDType::Buffer)
+                        .setDeletedResource(bufferIDs[i].value);
                 }
             }
             break;
@@ -4107,12 +4738,16 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
             const gl::BufferID *bufferIDs =
                 call.params.getParam("buffersPacked", ParamType::TBufferIDPointer, 1)
                     .value.BufferIDPointerVal;
+            FrameCaptureShared *frameCaptureShared =
+                context->getShareGroup()->getFrameCaptureShared();
+            ResourceTracker &resourceTracker = context->getFrameCaptureSharedResourceTracker();
             for (GLsizei i = 0; i < count; i++)
             {
                 // If we're capturing, track what new buffers have been genned
-                if (isCaptureActive())
+                if (frameCaptureShared->isCaptureActive())
                 {
-                    mResourceTracker.setGennedBuffer(bufferIDs[i]);
+                    resourceTracker.getTrackedResource(ResourceIDType::Buffer)
+                        .setGennedResource(bufferIDs[i].value);
                 }
             }
             break;
@@ -4121,10 +4756,13 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
         case EntryPoint::GLDeleteSync:
         {
             GLsync sync = call.params.getParam("sync", ParamType::TGLsync, 0).value.GLsyncVal;
+            FrameCaptureShared *frameCaptureShared =
+                context->getShareGroup()->getFrameCaptureShared();
+            ResourceTracker &resourceTracker = context->getFrameCaptureSharedResourceTracker();
             // If we're capturing, track which fence sync has been deleted
-            if (isCaptureActive())
+            if (frameCaptureShared->isCaptureActive())
             {
-                mResourceTracker.setDeletedFenceSync(sync);
+                resourceTracker.setDeletedFenceSync(sync);
             }
             break;
         }
@@ -4184,7 +4822,9 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
 
             if (isCaptureActive())
             {
-                mResourceTracker.setCreatedProgram(programID);
+                frameCaptureShared->getResourceTracker()
+                    .getTrackedResource(ResourceIDType::ShaderProgram)
+                    .setGennedResource(programID.value);
             }
             break;
         }
@@ -4194,8 +4834,10 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
             // If we're capturing, track which programs have been created
             if (isCaptureActive())
             {
-                gl::ShaderProgramID programID = {call.params.getReturnValue().value.GLuintVal};
-                mResourceTracker.setCreatedProgram(programID);
+                gl::ShaderProgramID programID    = {call.params.getReturnValue().value.GLuintVal};
+                ResourceTracker &resourceTracker = context->getFrameCaptureSharedResourceTracker();
+                resourceTracker.getTrackedResource(ResourceIDType::ShaderProgram)
+                    .setGennedResource(programID.value);
             }
             break;
         }
@@ -4208,7 +4850,9 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
                 const ParamCapture &param =
                     call.params.getParam("programPacked", ParamType::TShaderProgramID, 0);
 
-                mResourceTracker.setDeletedProgram(param.value.ShaderProgramIDVal);
+                ResourceTracker &resourceTracker = context->getFrameCaptureSharedResourceTracker();
+                resourceTracker.getTrackedResource(ResourceIDType::ShaderProgram)
+                    .setDeletedResource(param.value.ShaderProgramIDVal.value);
             }
             break;
         }
@@ -4276,12 +4920,22 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
                 call.params.getParam("texturesPacked", ParamType::TTextureIDConstPointer, 1)
                     .value.TextureIDConstPointerVal;
 
+            ResourceTracker &resourceTracker = context->getFrameCaptureSharedResourceTracker();
+
             // For each texture listed for deletion
             for (int32_t i = 0; i < n; ++i)
             {
                 // Look it up in the cache, and delete it if found
                 context->getShareGroup()->getFrameCaptureShared()->deleteCachedTextureLevelData(
                     textureIDs[i]);
+
+                // If we're capturing, track what textures have been deleted
+                if (isCaptureActive())
+                {
+
+                    resourceTracker.getTrackedResource(ResourceIDType::Texture)
+                        .setDeletedResource(textureIDs[i].value);
+                }
             }
             break;
         }
@@ -4304,7 +4958,9 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
             bool writable =
                 access == GL_WRITE_ONLY_OES || access == GL_WRITE_ONLY || access == GL_READ_WRITE;
 
-            trackBufferMapping(&call, buffer->id(), offset, length, writable);
+            FrameCaptureShared *frameCaptureShared =
+                context->getShareGroup()->getFrameCaptureShared();
+            frameCaptureShared->trackBufferMapping(&call, buffer->id(), offset, length, writable);
             break;
         }
 
@@ -4329,7 +4985,10 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
                     .value.BufferBindingVal;
             gl::Buffer *buffer = context->getState().getTargetBuffer(target);
 
-            trackBufferMapping(&call, buffer->id(), offset, length, access & GL_MAP_WRITE_BIT);
+            FrameCaptureShared *frameCaptureShared =
+                context->getShareGroup()->getFrameCaptureShared();
+            frameCaptureShared->trackBufferMapping(&call, buffer->id(), offset, length,
+                                                   access & GL_MAP_WRITE_BIT);
             break;
         }
 
@@ -4340,11 +4999,12 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
             captureMappedBufferSnapshot(context, call);
 
             // Track that the buffer was unmapped, for use during state reset
+            ResourceTracker &resourceTracker = context->getFrameCaptureSharedResourceTracker();
             gl::BufferBinding target =
                 call.params.getParam("targetPacked", ParamType::TBufferBinding, 0)
                     .value.BufferBindingVal;
             gl::Buffer *buffer = context->getState().getTargetBuffer(target);
-            mResourceTracker.setBufferUnmapped(buffer->id());
+            resourceTracker.setBufferUnmapped(buffer->id().value);
             break;
         }
 
@@ -4358,7 +5018,9 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
             gl::Buffer *buffer = context->getState().getTargetBuffer(target);
 
             // Track that this buffer's contents have been modified
-            mResourceTracker.setBufferModified(buffer->id());
+            ResourceTracker &resourceTracker = context->getFrameCaptureSharedResourceTracker();
+            resourceTracker.getTrackedResource(ResourceIDType::Buffer)
+                .setModifiedResource(buffer->id().value);
 
             // BufferData is equivalent to UnmapBuffer, for what we're tracking.
             // From the ES 3.1 spec in BufferData section:
@@ -4367,7 +5029,7 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
             //     6.3.1) is executed in each such context prior to deleting the existing data
             //     store.
             // Track that the buffer was unmapped, for use during state reset
-            mResourceTracker.setBufferUnmapped(buffer->id());
+            resourceTracker.setBufferUnmapped(buffer->id().value);
 
             break;
         }
@@ -4375,40 +5037,46 @@ void FrameCapture::maybeCapturePreCallUpdates(const gl::Context *context, CallCa
             break;
     }
 
-    mReadBufferSize = std::max(mReadBufferSize, call.params.getReadBufferSize());
+    if (IsTextureUpdate(call))
+    {
+        // If this call modified texture contents, track it for possible reset
+        trackTextureUpdate(context, call);
+    }
+
+    updateReadBufferSize(call.params.getReadBufferSize());
 
     gl::ShaderProgramID shaderProgramID;
     if (FindShaderProgramIDInCall(call, &shaderProgramID))
     {
-        mResourceTracker.onShaderProgramAccess(shaderProgramID);
+        ResourceTracker &resourceTracker = context->getFrameCaptureSharedResourceTracker();
+        resourceTracker.onShaderProgramAccess(shaderProgramID);
     }
 }
 
-void FrameCapture::captureCall(const gl::Context *context, CallCapture &&call, bool isCallValid)
+void FrameCaptureShared::captureCall(const gl::Context *context,
+                                     CallCapture &&call,
+                                     bool isCallValid)
 {
     if (SkipCall(call.entryPoint))
     {
         return;
     }
 
-    maybeOverrideEntryPoint(context, call);
-
-    maybeCapturePreCallUpdates(context, call);
-
     if (isCallValid)
     {
+        maybeOverrideEntryPoint(context, call);
+        maybeCapturePreCallUpdates(context, call);
         mFrameCalls.emplace_back(std::move(call));
+        maybeCapturePostCallUpdates(context);
     }
     else
     {
         INFO() << "FrameCapture: Not capturing invalid call to "
                << GetEntryPointName(call.entryPoint);
     }
-
-    maybeCapturePostCallUpdates(context);
 }
 
-void FrameCapture::maybeCapturePostCallUpdates(const gl::Context *context)
+void FrameCaptureShared::maybeCapturePostCallUpdates(const gl::Context *context)
 {
     // Process resource ID updates.
     MaybeCaptureUpdateResourceIDs(&mFrameCalls);
@@ -4450,9 +5118,9 @@ void FrameCapture::maybeCapturePostCallUpdates(const gl::Context *context)
     }
 }
 
-void FrameCapture::captureClientArraySnapshot(const gl::Context *context,
-                                              size_t vertexCount,
-                                              size_t instanceCount)
+void FrameCaptureShared::captureClientArraySnapshot(const gl::Context *context,
+                                                    size_t vertexCount,
+                                                    size_t instanceCount)
 {
     const gl::VertexArray *vao = context->getState().getVertexArray();
 
@@ -4499,7 +5167,8 @@ void FrameCapture::captureClientArraySnapshot(const gl::Context *context,
     }
 }
 
-void FrameCapture::captureMappedBufferSnapshot(const gl::Context *context, const CallCapture &call)
+void FrameCaptureShared::captureMappedBufferSnapshot(const gl::Context *context,
+                                                     const CallCapture &call)
 {
     // If the buffer was mapped writable, we need to restore its data, since we have no visibility
     // into what the client did to the buffer while mapped
@@ -4516,16 +5185,18 @@ void FrameCapture::captureMappedBufferSnapshot(const gl::Context *context, const
     gl::BufferBinding target =
         call.params.getParam("targetPacked", ParamType::TBufferBinding, 0).value.BufferBindingVal;
 
-    gl::Buffer *buffer         = context->getState().getTargetBuffer(target);
-    const auto &bufferDataInfo = mBufferDataMap.find(buffer->id());
-    if (bufferDataInfo == mBufferDataMap.end())
+    FrameCaptureShared *frameCaptureShared = context->getShareGroup()->getFrameCaptureShared();
+    gl::Buffer *buffer                     = context->getState().getTargetBuffer(target);
+    if (!frameCaptureShared->hasBufferData(buffer->id()))
     {
         // This buffer was not marked writable, so we did not back it up
         return;
     }
 
-    GLintptr offset   = bufferDataInfo->second.first;
-    GLsizeiptr length = bufferDataInfo->second.second;
+    std::pair<GLintptr, GLsizeiptr> bufferDataOffsetAndLength =
+        frameCaptureShared->getBufferDataOffsetAndLength(buffer->id());
+    GLintptr offset   = bufferDataOffsetAndLength.first;
+    GLsizeiptr length = bufferDataOffsetAndLength.second;
 
     // Map the buffer so we can copy its contents out
     ASSERT(!buffer->isMapped());
@@ -4558,16 +5229,20 @@ void FrameCapture::captureMappedBufferSnapshot(const gl::Context *context, const
     (void)buffer->unmap(context, &dontCare);
 }
 
-void FrameCapture::checkForCaptureTrigger()
+void FrameCaptureShared::checkForCaptureTrigger()
 {
     // If the capture trigger has not been set, move on
     if (mCaptureTrigger == 0)
+    {
         return;
+    }
 
     // Otherwise, poll the value for a change
     std::string captureTriggerStr = GetCaptureTrigger();
     if (captureTriggerStr.empty())
+    {
         return;
+    }
 
     // If the value has changed, use the original value as the frame count
     // TODO (anglebug.com/4949): Improve capture at unknown frame time. It is good to
@@ -4590,50 +5265,61 @@ void FrameCapture::checkForCaptureTrigger()
     }
 }
 
-void FrameCapture::onEndFrame(const gl::Context *context)
+void FrameCaptureShared::setupSharedAndAuxReplay(const gl::Context *context,
+                                                 bool isMidExecutionCapture)
 {
-    if (mFrameIndex > mCaptureEndFrame)
+    // Make sure all pending work for every Context in the share group has completed so all data
+    // (buffers, textures, etc.) has been updated and no resources are in use.
+    egl::ShareGroup *shareGroup            = context->getShareGroup();
+    const egl::ContextSet *shareContextSet = shareGroup->getContexts();
+    for (gl::Context *shareContext : *shareContextSet)
+    {
+        shareContext->finish();
+    }
+
+    clearSetupCalls();
+    if (isMidExecutionCapture)
+    {
+        CaptureSharedContextMidExecutionSetup(context, &mSetupCalls, &mResourceTracker);
+    }
+
+    WriteSharedContextCppReplay(mCompression, mOutDirectory, mCaptureLabel, 1, 1, mSetupCalls,
+                                &mResourceTracker, &mBinaryData, mSerializeStateEnabled, *this);
+
+    for (const gl::Context *shareContext : *shareContextSet)
+    {
+        FrameCapture *frameCapture = shareContext->getFrameCapture();
+        frameCapture->clearSetupCalls();
+
+        if (isMidExecutionCapture)
+        {
+            CaptureMidExecutionSetup(shareContext, &frameCapture->getSetupCalls(),
+                                     &mResourceTracker);
+        }
+
+        if (!frameCapture->getSetupCalls().empty() && shareContext->id() != context->id())
+        {
+            // The presentation context's setup functions will be written later as part of the
+            // WriteWindowSurfaceContextCppReplay() output.
+            WriteAuxiliaryContextCppSetupReplay(mCompression, mOutDirectory, shareContext,
+                                                mCaptureLabel, 1, frameCapture->getSetupCalls(),
+                                                &mBinaryData, mSerializeStateEnabled, *this);
+        }
+    }
+}
+
+void FrameCaptureShared::onEndFrame(const gl::Context *context)
+{
+    if (!enabled() || mFrameIndex > mCaptureEndFrame)
     {
         setCaptureInactive();
         return;
     }
 
-    // On Android, we can trigger a capture during the run
-    checkForCaptureTrigger();
+    FrameCapture *frameCapture = context->getFrameCapture();
 
-    // Done after checkForCaptureTrigger(), since that can modify mCaptureStartFrame.
-    if (mFrameIndex >= mCaptureStartFrame)
-    {
-        setCaptureActive();
-    }
-
-    // Note that we currently capture before the start frame to collect shader and program sources.
-    if (!mFrameCalls.empty() && isCaptureActive())
-    {
-        if (mIsFirstFrame)
-        {
-            mCaptureStartFrame = mFrameIndex;
-            mIsFirstFrame      = false;
-        }
-        WriteCppReplay(mCompression, mOutDirectory, context, mCaptureLabel, getReplayFrameIndex(),
-                       getFrameCount(), mFrameCalls, mSetupCalls, &mResourceTracker, &mBinaryData,
-                       mClientArraySizes, mReadBufferSize, mSerializeStateEnabled);
-        if (mFrameIndex == mCaptureEndFrame)
-        {
-            // Save the index files after the last frame.
-            writeCppReplayIndexFiles(context, false);
-            if (!mBinaryData.empty())
-            {
-                SaveBinaryData(mCompression, mOutDirectory, context->id(), mCaptureLabel,
-                               mBinaryData);
-                mBinaryData.clear();
-            }
-            mWroteIndexFile = true;
-        }
-    }
-
-    // Count resource IDs. This is also done on every frame. It could probably be done by checking
-    // the GL state instead of the calls.
+    // Count resource IDs. This is also done on every frame. It could probably be done by
+    // checking the GL state instead of the calls.
     for (const CallCapture &call : mFrameCalls)
     {
         for (const ParamCapture &param : call.params.getParamCaptures())
@@ -4646,17 +5332,81 @@ void FrameCapture::onEndFrame(const gl::Context *context)
         }
     }
 
+    // On Android, we can trigger a capture during the run
+    checkForCaptureTrigger();
+    // Done after checkForCaptureTrigger(), since that can modify mCaptureStartFrame.
+    if (mFrameIndex >= mCaptureStartFrame)
+    {
+        setCaptureActive();
+        // Assume that the context performing the swap is the "main" context.
+        mWindowSurfaceContextID = context->id();
+    }
+    else
+    {
+        reset();
+        mFrameIndex++;
+
+        // When performing a mid-execution capture, setup the replay before capturing calls for the
+        // first frame.
+        if (mFrameIndex == mCaptureStartFrame)
+        {
+            setupSharedAndAuxReplay(context, true);
+        }
+
+        // Not capturing yet, so return.
+        return;
+    }
+
+    if (mIsFirstFrame)
+    {
+        mCaptureStartFrame = mFrameIndex;
+
+        // When *not* performing a mid-execution capture, setup the replay with the first frame.
+        if (mCaptureStartFrame == 1)
+        {
+            setupSharedAndAuxReplay(context, false);
+        }
+    }
+
+    if (!mFrameCalls.empty())
+    {
+        mActiveFrameIndices.push_back(getReplayFrameIndex());
+    }
+
+    // Note that we currently capture before the start frame to collect shader and program sources.
+    // For simplicity, it's currently a requirement that the same context is used to perform the
+    // swap every frame.
+    ASSERT(mWindowSurfaceContextID == context->id());
+
+    // Make sure all pending work for every Context in the share group has completed so all data
+    // (buffers, textures, etc.) has been updated and no resources are in use.
+    egl::ShareGroup *shareGroup            = context->getShareGroup();
+    const egl::ContextSet *shareContextSet = shareGroup->getContexts();
+    for (gl::Context *shareContext : *shareContextSet)
+    {
+        shareContext->finish();
+    }
+
+    WriteWindowSurfaceContextCppReplay(mCompression, mOutDirectory, context, mCaptureLabel,
+                                       getReplayFrameIndex(), getFrameCount(), mFrameCalls,
+                                       frameCapture->getSetupCalls(), &mResourceTracker,
+                                       &mBinaryData, mSerializeStateEnabled, *this);
+
+    if (mFrameIndex == mCaptureEndFrame)
+    {
+        // Save the index files after the last frame.
+        writeCppReplayIndexFiles(context, false);
+        SaveBinaryData(mCompression, mOutDirectory, kSharedContextId, mCaptureLabel, mBinaryData);
+        mBinaryData.clear();
+        mWroteIndexFile = true;
+    }
+
     reset();
     mFrameIndex++;
-
-    if (enabled() && mFrameIndex == mCaptureStartFrame)
-    {
-        mSetupCalls.clear();
-        CaptureMidExecutionSetup(context, &mSetupCalls, &mResourceTracker, this);
-    }
+    mIsFirstFrame = false;
 }
 
-void FrameCapture::onDestroyContext(const gl::Context *context)
+void FrameCaptureShared::onDestroyContext(const gl::Context *context)
 {
     if (!mEnabled)
     {
@@ -4670,19 +5420,18 @@ void FrameCapture::onDestroyContext(const gl::Context *context)
         mFrameIndex -= 1;
         mCaptureEndFrame = mFrameIndex;
         writeCppReplayIndexFiles(context, true);
-        if (!mBinaryData.empty())
-        {
-            SaveBinaryData(mCompression, mOutDirectory, context->id(), mCaptureLabel, mBinaryData);
-            mBinaryData.clear();
-        }
+        SaveBinaryData(mCompression, mOutDirectory, kSharedContextId, mCaptureLabel, mBinaryData);
+        mBinaryData.clear();
         mWroteIndexFile = true;
     }
 }
 
-void FrameCapture::onMakeCurrent(const gl::Context *context, const egl::Surface *drawSurface)
+void FrameCaptureShared::onMakeCurrent(const gl::Context *context, const egl::Surface *drawSurface)
 {
     if (!drawSurface)
+    {
         return;
+    }
 
     // Track the width and height of the draw surface as provided to makeCurrent
     mDrawSurfaceDimensions[context->id()] =
@@ -4726,37 +5475,13 @@ void StringCounters::setStringCounter(std::vector<std::string> &strings, int &co
     mStringCounterMap[strings] = counter;
 }
 
+TrackedResource::TrackedResource() = default;
+
+TrackedResource::~TrackedResource() = default;
+
 ResourceTracker::ResourceTracker() = default;
 
 ResourceTracker::~ResourceTracker() = default;
-
-void ResourceTracker::setDeletedBuffer(gl::BufferID id)
-{
-    if (id.value == 0)
-    {
-        // Ignore buffer ID 0
-        return;
-    }
-
-    if (mNewBuffers.find(id) != mNewBuffers.end())
-    {
-        // This is a buffer genned after MEC was initialized, just clear it, since there will be no
-        // actions required for it to return to starting state.
-        mNewBuffers.erase(id);
-        return;
-    }
-
-    if (mStartingBuffers.find(id) != mStartingBuffers.end())
-    {
-        // The app is deleting a buffer we started with, we need to regen on loop
-        mBuffersToRegen.insert(id);
-        mBuffersToRestore.insert(id);
-    }
-
-    // If none of the above is true, the app is deleting a buffer that was never genned.
-    // This is allowed by the spec for DeleteBuffers:
-    //    Unused names in buffers are silently ignored, as is the value zero.
-}
 
 void ResourceTracker::setDeletedFenceSync(GLsync sync)
 {
@@ -4771,77 +5496,89 @@ void ResourceTracker::setDeletedFenceSync(GLsync sync)
     mFenceSyncsToRegen.insert(sync);
 }
 
-void ResourceTracker::setCreatedProgram(gl::ShaderProgramID id)
+void TrackedResource::setGennedResource(GLuint id)
 {
-    if (mStartingPrograms.find(id) == mStartingPrograms.end())
+    if (mStartingResources.find(id) == mStartingResources.end())
     {
-        // This is a program created after MEC was initialized, track it
-        mNewPrograms.insert(id);
+        // This is a resource created after MEC was initialized, track it
+        mNewResources.insert(id);
         return;
     }
 }
 
-void ResourceTracker::setDeletedProgram(gl::ShaderProgramID id)
+void TrackedResource::setDeletedResource(GLuint id)
 {
-    if (id.value == 0)
+    if (id == 0)
     {
-        // Ignore program ID 0
+        // Ignore ID 0
         return;
     }
 
-    if (mNewPrograms.find(id) != mNewPrograms.end())
+    if (mNewResources.find(id) != mNewResources.end())
     {
-        // This is a program created after MEC was initialized, just clear it, since there will be
+        // This is a resource created after MEC was initialized, just clear it, since there will be
         // no actions required for it to return to starting state.
-        mNewPrograms.erase(id);
+        mNewResources.erase(id);
         return;
     }
 
-    // Ensure this program was in our starting set
-    // It's possible this could fire if the app deletes programs that were never generated
-    ASSERT(mStartingPrograms.empty() || (mStartingPrograms.find(id) != mStartingPrograms.end()));
+    if (mStartingResources.find(id) != mStartingResources.end())
+    {
+        // In this case, the app is deleting a resource we started with, we need to regen on loop
+        mResourcesToRegen.insert(id);
 
-    // In this case, the app is deleting a program we started with, we need to regen on loop
-    mProgramsToRegen.insert(id);
+        // Also restore its contents
+        mResourcesToRestore.insert(id);
+    }
+
+    // If none of the above is true, the app is deleting a resource that was never genned.
 }
 
-void ResourceTracker::setGennedBuffer(gl::BufferID id)
+void TrackedResource::setModifiedResource(GLuint id)
 {
-    if (mStartingBuffers.find(id) == mStartingBuffers.end())
+    // If this was a starting resource, we need to track it for restore
+    if (mStartingResources.find(id) != mStartingResources.end())
     {
-        // This is a buffer genned after MEC was initialized, track it
-        mNewBuffers.insert(id);
-        return;
+        mResourcesToRestore.insert(id);
     }
 }
 
-void ResourceTracker::setBufferModified(gl::BufferID id)
-{
-    // If this was a starting buffer, we need to track it for restore
-    if (mStartingBuffers.find(id) != mStartingBuffers.end())
-    {
-        mBuffersToRestore.insert(id);
-    }
-}
-
-void ResourceTracker::setBufferMapped(gl::BufferID id)
+void ResourceTracker::setBufferMapped(GLuint id)
 {
     // If this was a starting buffer, we may need to restore it to original state during Reset
-    if (mStartingBuffers.find(id) != mStartingBuffers.end())
+    TrackedResource &trackedBuffers = getTrackedResource(ResourceIDType::Buffer);
+    if (trackedBuffers.getStartingResources().find(id) !=
+        trackedBuffers.getStartingResources().end())
     {
         // Track that its current state is mapped (true)
         mStartingBuffersMappedCurrent[id] = true;
     }
 }
 
-void ResourceTracker::setBufferUnmapped(gl::BufferID id)
+void ResourceTracker::setBufferUnmapped(GLuint id)
 {
     // If this was a starting buffer, we may need to restore it to original state during Reset
-    if (mStartingBuffers.find(id) != mStartingBuffers.end())
+    TrackedResource &trackedBuffers = getTrackedResource(ResourceIDType::Buffer);
+    if (trackedBuffers.getStartingResources().find(id) !=
+        trackedBuffers.getStartingResources().end())
     {
         // Track that its current state is unmapped (false)
         mStartingBuffersMappedCurrent[id] = false;
     }
+}
+
+bool ResourceTracker::getStartingBuffersMappedCurrent(GLuint id) const
+{
+    const auto &foundBool = mStartingBuffersMappedCurrent.find(id);
+    ASSERT(foundBool != mStartingBuffersMappedCurrent.end());
+    return foundBool->second;
+}
+
+bool ResourceTracker::getStartingBuffersMappedInitial(GLuint id) const
+{
+    const auto &foundBool = mStartingBuffersMappedInitial.find(id);
+    ASSERT(foundBool != mStartingBuffersMappedInitial.end());
+    return foundBool->second;
 }
 
 void ResourceTracker::onShaderProgramAccess(gl::ShaderProgramID shaderProgramID)
@@ -4849,7 +5586,7 @@ void ResourceTracker::onShaderProgramAccess(gl::ShaderProgramID shaderProgramID)
     mMaxShaderPrograms = std::max(mMaxShaderPrograms, shaderProgramID.value + 1);
 }
 
-bool FrameCapture::isCapturing() const
+bool FrameCaptureShared::isCapturing() const
 {
     // Currently we will always do a capture up until the last frame. In the future we could improve
     // mid execution capture by only capturing between the start and end frames. The only necessary
@@ -4857,17 +5594,17 @@ bool FrameCapture::isCapturing() const
     return mEnabled && mFrameIndex <= mCaptureEndFrame;
 }
 
-uint32_t FrameCapture::getFrameCount() const
+uint32_t FrameCaptureShared::getFrameCount() const
 {
     return mCaptureEndFrame - mCaptureStartFrame + 1;
 }
 
-uint32_t FrameCapture::getReplayFrameIndex() const
+uint32_t FrameCaptureShared::getReplayFrameIndex() const
 {
     return mFrameIndex - mCaptureStartFrame + 1;
 }
 
-void FrameCapture::replay(gl::Context *context)
+void FrameCaptureShared::replay(gl::Context *context)
 {
     ReplayContext replayContext(mReadBufferSize, mClientArraySizes);
     for (const CallCapture &call : mFrameCalls)
@@ -4902,7 +5639,8 @@ void FrameCapture::replay(gl::Context *context)
     }
 }
 
-void FrameCapture::writeCppReplayIndexFiles(const gl::Context *context, bool writeResetContextCall)
+void FrameCaptureShared::writeCppReplayIndexFiles(const gl::Context *context,
+                                                  bool writeResetContextCall)
 {
     const gl::ContextID contextId       = context->id();
     const egl::Config *config           = context->getConfig();
@@ -4987,8 +5725,11 @@ void FrameCapture::writeCppReplayIndexFiles(const gl::Context *context, bool wri
         header << "\n";
     }
 
+    header << "void InitReplay();\n";
+
     source << "#include \"" << FmtCapturePrefix(contextId, mCaptureLabel) << ".h\"\n";
     source << "#include \"trace_fixture.h\"\n";
+    source << "#include \"angle_trace_gl.h\"\n";
     source << "\n";
 
     if (!mCaptureLabel.empty())
@@ -4997,12 +5738,18 @@ void FrameCapture::writeCppReplayIndexFiles(const gl::Context *context, bool wri
         source << "\n";
     }
 
+    source << "void " << mCaptureLabel << "::InitReplay()\n";
+    source << "{\n";
+    WriteInitReplayCall(mCompression, source, kSharedContextId, mCaptureLabel,
+                        MaxClientArraySize(mClientArraySizes), mReadBufferSize);
+    source << "}\n";
+
     source << "extern \"C\" {\n";
     source << "void ReplayFrame(uint32_t frameIndex)\n";
     source << "{\n";
     source << "    switch (frameIndex)\n";
     source << "    {\n";
-    for (uint32_t frameIndex = 1; frameIndex <= frameCount; ++frameIndex)
+    for (uint32_t frameIndex : mActiveFrameIndices)
     {
         source << "        case " << frameIndex << ":\n";
         source << "            " << FmtReplayFunction(contextId, frameIndex) << ";\n";
@@ -5037,7 +5784,7 @@ void FrameCapture::writeCppReplayIndexFiles(const gl::Context *context, bool wri
                    << FmtGetSerializedContextStateFunction(contextId, frameIndex) << ";\n";
         }
         source << "        default:\n";
-        source << "            return \"\";\n";
+        source << "            return nullptr;\n";
         source << "    }\n";
         source << "}\n";
         source << "\n";
@@ -5083,22 +5830,31 @@ void FrameCapture::writeCppReplayIndexFiles(const gl::Context *context, bool wri
         {
             saveIndex << GetCaptureFileName(contextId, mCaptureLabel, frameIndex, ".cpp") << "\n";
         }
+
+        egl::ShareGroup *shareGroup      = context->getShareGroup();
+        egl::ContextSet *shareContextSet = shareGroup->getContexts();
+        for (gl::Context *shareContext : *shareContextSet)
+        {
+            if (shareContext->id() == contextId)
+            {
+                // We already listed all of the "main" context's files, so skip it here.
+                continue;
+            }
+            saveIndex << GetCaptureFileName(shareContext->id(), mCaptureLabel, 1, ".cpp") << "\n";
+        }
+        saveIndex << GetCaptureFileName(kSharedContextId, mCaptureLabel, 1, ".cpp") << "\n";
     }
 }
 
-void FrameCapture::reset()
+void FrameCaptureShared::reset()
 {
     mFrameCalls.clear();
-    mSetupCalls.clear();
     mClientVertexArrayMap.fill(-1);
 
     // Do not reset replay-specific settings like the maximum read buffer size, client array sizes,
     // or the 'has seen' type map. We could refine this into per-frame and per-capture maximums if
     // necessary.
 }
-
-FrameCaptureShared::FrameCaptureShared()  = default;
-FrameCaptureShared::~FrameCaptureShared() = default;
 
 const std::string &FrameCaptureShared::getShaderSource(gl::ShaderProgramID id) const
 {
@@ -5412,6 +6168,38 @@ void WriteParamValueReplay<ParamType::TvoidConstPointer>(std::ostream &os,
 }
 
 template <>
+void WriteParamValueReplay<ParamType::TGLfloatConstPointer>(std::ostream &os,
+                                                            const CallCapture &call,
+                                                            const GLfloat *value)
+{
+    if (value == 0)
+    {
+        os << "nullptr";
+    }
+    else
+    {
+        os << "reinterpret_cast<const GLfloat *>("
+           << static_cast<int>(reinterpret_cast<uintptr_t>(value)) << ")";
+    }
+}
+
+template <>
+void WriteParamValueReplay<ParamType::TGLuintConstPointer>(std::ostream &os,
+                                                           const CallCapture &call,
+                                                           const GLuint *value)
+{
+    if (value == 0)
+    {
+        os << "nullptr";
+    }
+    else
+    {
+        os << "reinterpret_cast<const GLuint *>("
+           << static_cast<int>(reinterpret_cast<uintptr_t>(value)) << ")";
+    }
+}
+
+template <>
 void WriteParamValueReplay<ParamType::TGLDEBUGPROCKHR>(std::ostream &os,
                                                        const CallCapture &call,
                                                        GLDEBUGPROCKHR value)
@@ -5436,7 +6224,7 @@ void WriteParamValueReplay<ParamType::TFenceNVID>(std::ostream &os,
                                                   const CallCapture &call,
                                                   gl::FenceNVID value)
 {
-    os << "gFenceMap[" << value.value << "]";
+    os << "gFenceNVMap[" << value.value << "]";
 }
 
 template <>
@@ -5492,7 +6280,7 @@ void WriteParamValueReplay<ParamType::TSemaphoreID>(std::ostream &os,
                                                     const CallCapture &call,
                                                     gl::SemaphoreID value)
 {
-    os << "gSempahoreMap[" << value.value << "]";
+    os << "gSemaphoreMap[" << value.value << "]";
 }
 
 template <>
@@ -5581,7 +6369,17 @@ void WriteParamValueReplay<ParamType::TGLeglImageOES>(std::ostream &os,
                                                       const CallCapture &call,
                                                       GLeglImageOES value)
 {
-    os << "reinterpret_cast<EGLImageKHR>(" << value << ")";
+    uint64_t pointerValue = reinterpret_cast<uint64_t>(value);
+    os << "reinterpret_cast<EGLImageKHR>(" << pointerValue << "ul)";
+}
+
+template <>
+void WriteParamValueReplay<ParamType::TGLubyte>(std::ostream &os,
+                                                const CallCapture &call,
+                                                GLubyte value)
+{
+    const int v = value;
+    os << v;
 }
 
 }  // namespace angle

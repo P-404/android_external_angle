@@ -398,9 +398,10 @@ class DynamicallyGrowingPool : angle::NonCopyable
 // another is created.  The query pools live permanently, but are recycled as indices get freed.
 
 // These are arbitrary default sizes for query pools.
-constexpr uint32_t kDefaultOcclusionQueryPoolSize         = 64;
-constexpr uint32_t kDefaultTimestampQueryPoolSize         = 64;
-constexpr uint32_t kDefaultTransformFeedbackQueryPoolSize = 128;
+constexpr uint32_t kDefaultOcclusionQueryPoolSize           = 64;
+constexpr uint32_t kDefaultTimestampQueryPoolSize           = 64;
+constexpr uint32_t kDefaultTransformFeedbackQueryPoolSize   = 128;
+constexpr uint32_t kDefaultPrimitivesGeneratedQueryPoolSize = 128;
 
 class QueryHelper;
 
@@ -413,7 +414,7 @@ class DynamicQueryPool final : public DynamicallyGrowingPool<QueryPool>
     angle::Result init(ContextVk *contextVk, VkQueryType type, uint32_t poolSize);
     void destroy(VkDevice device);
 
-    angle::Result allocateQuery(ContextVk *contextVk, QueryHelper *queryOut);
+    angle::Result allocateQuery(ContextVk *contextVk, QueryHelper *queryOut, uint32_t queryCount);
     void freeQuery(ContextVk *contextVk, QueryHelper *query);
 
     const QueryPool &getQueryPool(size_t index) const { return mPools[index]; }
@@ -438,12 +439,12 @@ class QueryResult final
     }
 
     size_t getDataSize() const { return mIntsPerResult * sizeof(uint64_t); }
+    void setResults(uint64_t *results, uint32_t queryCount);
     uint64_t getResult(size_t index) const
     {
         ASSERT(index < mIntsPerResult);
         return mResults[index];
     }
-    uint64_t *getPointerToResults() { return mResults.data(); }
 
     static constexpr size_t kDefaultResultIndex                      = 0;
     static constexpr size_t kTransformFeedbackPrimitivesWrittenIndex = 0;
@@ -454,7 +455,7 @@ class QueryResult final
     std::array<uint64_t, 2> mResults;
 };
 
-// Queries in vulkan are identified by the query pool and an index for a query within that pool.
+// Queries in Vulkan are identified by the query pool and an index for a query within that pool.
 // Unlike other pools, such as descriptor pools where an allocation returns an independent object
 // from the pool, the query allocations are not done through a Vulkan function and are only an
 // integer index.
@@ -462,7 +463,9 @@ class QueryResult final
 // Furthermore, to support arbitrarily large number of queries, DynamicQueryPool creates query pools
 // of a fixed size as needed and allocates indices within those pools.
 //
-// The QueryHelper class below keeps the pool and index pair together.
+// The QueryHelper class below keeps the pool and index pair together.  For multiview, multiple
+// consecutive query indices are implicitly written to by the driver, so the query count is
+// additionally kept.
 class QueryHelper final : public Resource
 {
   public:
@@ -472,7 +475,8 @@ class QueryHelper final : public Resource
     QueryHelper &operator=(QueryHelper &&rhs);
     void init(const DynamicQueryPool *dynamicQueryPool,
               const size_t queryPoolIndex,
-              uint32_t query);
+              uint32_t query,
+              uint32_t queryCount);
     void deinit();
 
     bool valid() const { return mDynamicQueryPool != nullptr; }
@@ -512,10 +516,14 @@ class QueryHelper final : public Resource
                         CommandBuffer *resetCommandBuffer,
                         CommandBuffer *commandBuffer);
     void endQueryImpl(ContextVk *contextVk, CommandBuffer *commandBuffer);
+    VkResult getResultImpl(ContextVk *contextVk,
+                           const VkQueryResultFlags flags,
+                           QueryResult *resultOut);
 
     const DynamicQueryPool *mDynamicQueryPool;
     size_t mQueryPoolIndex;
     uint32_t mQuery;
+    uint32_t mQueryCount;
 };
 
 // DynamicSemaphorePool allocates semaphores as needed.  It uses a std::vector
@@ -1428,7 +1436,8 @@ class ImageHelper final : public Resource, public angle::Subject
                        gl::LevelIndex firstLevel,
                        uint32_t mipLevels,
                        uint32_t layerCount,
-                       bool isRobustResourceInitEnabled);
+                       bool isRobustResourceInitEnabled,
+                       bool hasProtectedContent);
     angle::Result initMSAASwapchain(Context *context,
                                     gl::TextureType textureType,
                                     const VkExtent3D &extents,
@@ -1439,7 +1448,8 @@ class ImageHelper final : public Resource, public angle::Subject
                                     gl::LevelIndex firstLevel,
                                     uint32_t mipLevels,
                                     uint32_t layerCount,
-                                    bool isRobustResourceInitEnabled);
+                                    bool isRobustResourceInitEnabled,
+                                    bool hasProtectedContent);
     angle::Result initExternal(Context *context,
                                gl::TextureType textureType,
                                const VkExtent3D &extents,
@@ -1453,8 +1463,10 @@ class ImageHelper final : public Resource, public angle::Subject
                                uint32_t mipLevels,
                                uint32_t layerCount,
                                bool isRobustResourceInitEnabled,
-                               bool *imageFormatListEnabledOut);
+                               bool *imageFormatListEnabledOut,
+                               bool hasProtectedContent);
     angle::Result initMemory(Context *context,
+                             bool hasProtectedContent,
                              const MemoryProperties &memoryProperties,
                              VkMemoryPropertyFlags flags);
     angle::Result initExternalMemory(
@@ -1509,6 +1521,7 @@ class ImageHelper final : public Resource, public angle::Subject
     // - FramebufferVk::readPixelsImpl
     //
     angle::Result init2DStaging(Context *context,
+                                bool hasProtectedContent,
                                 const MemoryProperties &memoryProperties,
                                 const gl::Extents &glExtents,
                                 const Format &format,
@@ -1519,6 +1532,7 @@ class ImageHelper final : public Resource, public angle::Subject
     // - TextureVk::copyAndStageImageData
     //
     angle::Result initStaging(Context *context,
+                              bool hasProtectedContent,
                               const MemoryProperties &memoryProperties,
                               VkImageType imageType,
                               const VkExtent3D &extents,
@@ -1530,6 +1544,7 @@ class ImageHelper final : public Resource, public angle::Subject
     // Create a multisampled image for use as the implicit image in multisampled render to texture
     // rendering.  If LAZILY_ALLOCATED memory is available, it will prefer that.
     angle::Result initImplicitMultisampledRenderToTexture(Context *context,
+                                                          bool hasProtectedContent,
                                                           const MemoryProperties &memoryProperties,
                                                           gl::TextureType textureType,
                                                           GLint samples,
@@ -1871,7 +1886,7 @@ class ImageHelper final : public Resource, public angle::Subject
                  uint32_t layerStart,
                  uint32_t layerCount,
                  VkImageAspectFlags aspectFlags);
-    bool hasImmutableSampler() const { return mExternalFormat != 0; }
+    bool hasImmutableSampler() const;
     uint64_t getExternalFormat() const { return mExternalFormat; }
 
     // Used by framebuffer and render pass functions to decide loadOps and invalidate/un-invalidate
@@ -1994,7 +2009,9 @@ class ImageHelper final : public Resource, public angle::Subject
                            uint32_t layerCount,
                            CommandBuffer *commandBuffer);
 
-    angle::Result initializeNonZeroMemory(Context *context, VkDeviceSize size);
+    angle::Result initializeNonZeroMemory(Context *context,
+                                          bool hasProtectedContent,
+                                          VkDeviceSize size);
 
     std::vector<SubresourceUpdate> *getLevelUpdates(gl::LevelIndex level);
     const std::vector<SubresourceUpdate> *getLevelUpdates(gl::LevelIndex level) const;
@@ -2113,12 +2130,20 @@ using ImageViewVector = std::vector<ImageView>;
 // A vector of vector of image views.  Primary index is layer, secondary index is level.
 using LayerLevelImageViewVector = std::vector<ImageViewVector>;
 
-// Address mode for layers: only possible to access either 1 layer or all layers.
+// Address mode for layers: only possible to access either all layers, or up to
+// IMPLEMENTATION_ANGLE_MULTIVIEW_MAX_VIEWS layers.  This enum uses 0 for all layers and the rest of
+// the values conveniently alias the number of layers.
 enum LayerMode
 {
-    Single,
-    All
+    All,
+    _1,
+    _2,
+    _3,
+    _4,
 };
+static_assert(gl::IMPLEMENTATION_ANGLE_MULTIVIEW_MAX_VIEWS == 4, "Update LayerMode");
+
+LayerMode GetLayerMode(const vk::ImageHelper &image, uint32_t layerCount);
 
 // Sampler decode mode indicating if an attachment needs to be decoded in linear colorspace or sRGB
 enum class SrgbDecodeMode
@@ -2254,10 +2279,13 @@ class ImageViewHelper final : public Resource
                                                 angle::FormatID formatID,
                                                 const ImageView **imageViewOut);
 
-    // Creates a draw view with all layers of the level.
+    // Creates a draw view with a range of layers of the level.
     angle::Result getLevelDrawImageView(ContextVk *contextVk,
                                         const ImageHelper &image,
                                         LevelIndex levelVk,
+                                        uint32_t layer,
+                                        uint32_t layerCount,
+                                        gl::SrgbWriteControlMode mode,
                                         const ImageView **imageViewOut);
 
     // Creates a draw view with a single layer of the level.
@@ -2358,11 +2386,9 @@ class ImageViewHelper final : public Resource
     bool mLinearColorspace;
 
     // Draw views
-    ImageViewVector mLevelDrawImageViews;
     LayerLevelImageViewVector mLayerLevelDrawImageViews;
-
-    ImageViewVector mLevelDrawImageViewsLinear;
     LayerLevelImageViewVector mLayerLevelDrawImageViewsLinear;
+    angle::HashMap<ImageSubresourceRange, std::unique_ptr<ImageView>> mSubresourceDrawImageViews;
 
     // Storage views
     ImageViewVector mLevelStorageImageViews;
@@ -2371,6 +2397,17 @@ class ImageViewHelper final : public Resource
     // Serial for the image view set. getSubresourceSerial combines it with subresource info.
     ImageOrBufferViewSerial mImageViewSerial;
 };
+
+ImageSubresourceRange MakeImageSubresourceReadRange(gl::LevelIndex level,
+                                                    uint32_t levelCount,
+                                                    uint32_t layer,
+                                                    LayerMode layerMode,
+                                                    SrgbDecodeMode srgbDecodeMode,
+                                                    gl::SrgbOverride srgbOverrideMode);
+ImageSubresourceRange MakeImageSubresourceDrawRange(gl::LevelIndex level,
+                                                    uint32_t layer,
+                                                    LayerMode layerMode,
+                                                    gl::SrgbWriteControlMode srgbWriteControlMode);
 
 class BufferViewHelper final : public Resource
 {

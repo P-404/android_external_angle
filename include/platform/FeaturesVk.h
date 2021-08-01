@@ -161,10 +161,16 @@ struct FeaturesVk : FeatureSetBase
         "VkDevice supports the EGL_ANDROID_native_fence_sync extension", &members,
         "http://anglebug.com/2517"};
 
-    // Whether the VkDevice can support imageCubeArray feature properly.
+    // Whether the VkDevice can support the imageCubeArray feature properly.
     Feature supportsImageCubeArray = {"supportsImageCubeArray", FeatureCategory::VulkanFeatures,
                                       "VkDevice supports the imageCubeArray feature properly",
                                       &members, "http://anglebug.com/3584"};
+
+    // Whether the VkDevice supports the pipelineStatisticsQuery feature.
+    Feature supportsPipelineStatisticsQuery = {
+        "supportsPipelineStatisticsQuery", FeatureCategory::VulkanFeatures,
+        "VkDevice supports the pipelineStatisticsQuery feature", &members,
+        "http://anglebug.com/5430"};
 
     // Whether the VkDevice supports the VK_EXT_shader_stencil_export extension, which is used to
     // perform multisampled resolve of stencil buffer.  A multi-step workaround is used instead if
@@ -221,6 +227,11 @@ struct FeaturesVk : FeatureSetBase
         "supportsMultisampledRenderToSingleSampled", FeatureCategory::VulkanFeatures,
         "VkDevice supports the VK_EXT_multisampled_render_to_single_sampled extension", &members,
         "http://anglebug.com/4836"};
+
+    // Whether the VkDevice supports the VK_KHR_multiview extension.  http://anglebug.com/6048
+    Feature supportsMultiview = {"supportsMultiview", FeatureCategory::VulkanFeatures,
+                                 "VkDevice supports the VK_KHR_multiview extension", &members,
+                                 "http://anglebug.com/6048"};
 
     // VK_PRESENT_MODE_FIFO_KHR causes random timeouts on Linux Intel. http://anglebug.com/3153
     Feature disableFifoPresentMode = {"disableFifoPresentMode", FeatureCategory::VulkanWorkarounds,
@@ -534,6 +545,34 @@ struct FeaturesVk : FeatureSetBase
         "preferSubmitAtFBOBoundary", FeatureCategory::VulkanWorkarounds,
         "Submit commands to driver at each FBO boundary for performance improvements.", &members,
         "https://issuetracker.google.com/187425444"};
+
+    // Workaround for gap in Vulkan spec related to querying descriptor count for immutable samplers
+    // tied to an external format.
+    Feature useMultipleDescriptorsForExternalFormats = {
+        "useMultipleDescriptorsForExternalFormats", FeatureCategory::VulkanWorkarounds,
+        "Return a default descriptor count for external formats.", &members,
+        "http://anglebug.com/6141"};
+
+    // Whether the VkDevice can support Protected Memory.
+    Feature supportsProtectedMemory = {"supports_protected_memory", FeatureCategory::VulkanFeatures,
+                                       "VkDevice supports protected memory", &members,
+                                       "http://anglebug.com/3965"};
+
+    // Whether the VkInstance supports the VK_KHR_get_surface_capabilities2 extension.
+    Feature supportsSurfaceCapabilities2Extension = {
+        "supportsSurfaceCapabilities2Extension", FeatureCategory::VulkanFeatures,
+        "VkInstance supports the VK_KHR_get_surface_capabilities2 extension", &members};
+
+    // Whether the VkInstance supports the VK_KHR_surface_protected_capabilities extension.
+    Feature supportsSurfaceProtectedCapabilitiesExtension = {
+        "supportsSurfaceProtectedCapabilitiesExtension", FeatureCategory::VulkanFeatures,
+        "VkInstance supports the VK_KHR_surface_protected_capabilities extension", &members};
+
+    // Whether the VkSurface supports protected swapchains from
+    // supportsSurfaceProtectedCapabilitiesExtension.
+    Feature supportsSurfaceProtectedSwapchains = {
+        "supportsSurfaceProtectedSwapchains", FeatureCategory::VulkanFeatures,
+        "VkSurface supportsProtected for protected swapchains", &members};
 };
 
 inline FeaturesVk::FeaturesVk()  = default;

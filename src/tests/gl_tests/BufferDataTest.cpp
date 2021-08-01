@@ -78,34 +78,14 @@ void main()
     GLint mAttribLocation;
 };
 
-// Disabled in debug because it's way too slow.
-#if !defined(NDEBUG)
-#    define MAYBE_NULLData DISABLED_NULLData
-#else
-#    define MAYBE_NULLData NULLData
-#endif  // !defined(NDEBUG)
-
-TEST_P(BufferDataTest, MAYBE_NULLData)
+// If glBufferData was not called yet the capturing must not try to
+// read the data. http://anglebug.com/6093
+TEST_P(BufferDataTest, Uninitialized)
 {
+    // Trigger frame capture to try capturing the
+    // generated but uninitialized buffer
     glBindBuffer(GL_ARRAY_BUFFER, mBuffer);
-    EXPECT_GL_NO_ERROR();
-
-    const int numIterations = 128;
-    for (int i = 0; i < numIterations; ++i)
-    {
-        GLsizei bufferSize = sizeof(GLfloat) * (i + 1);
-        glBufferData(GL_ARRAY_BUFFER, bufferSize, nullptr, GL_STATIC_DRAW);
-        EXPECT_GL_NO_ERROR();
-
-        for (int j = 0; j < bufferSize; j++)
-        {
-            for (int k = 0; k < bufferSize - j; k++)
-            {
-                glBufferSubData(GL_ARRAY_BUFFER, k, j, nullptr);
-                ASSERT_GL_NO_ERROR();
-            }
-        }
-    }
+    swapBuffers();
 }
 
 TEST_P(BufferDataTest, ZeroNonNULLData)
@@ -803,10 +783,9 @@ TEST_P(BufferDataTestES3, BufferDataUnmap)
     glBufferData(GL_ARRAY_BUFFER, data1.size(), data1.data(), GL_STATIC_DRAW);
 
     // Map the buffer once
-    void *mappedBuffer =
-        glMapBufferRange(GL_ARRAY_BUFFER, 0, data1.size(),
-                         GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT |
-                             GL_MAP_FLUSH_EXPLICIT_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+    glMapBufferRange(GL_ARRAY_BUFFER, 0, data1.size(),
+                     GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_FLUSH_EXPLICIT_BIT |
+                         GL_MAP_UNSYNCHRONIZED_BIT);
 
     // Then repopulate the buffer. This should cause the buffer to become unmapped.
     glBufferData(GL_ARRAY_BUFFER, data2.size(), data2.data(), GL_STATIC_DRAW);
@@ -818,9 +797,9 @@ TEST_P(BufferDataTestES3, BufferDataUnmap)
     EXPECT_GL_ERROR(GL_INVALID_OPERATION);
 
     // Try to map the buffer again, which should succeed
-    mappedBuffer = glMapBufferRange(GL_ARRAY_BUFFER, 0, data2.size(),
-                                    GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT |
-                                        GL_MAP_FLUSH_EXPLICIT_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+    glMapBufferRange(GL_ARRAY_BUFFER, 0, data2.size(),
+                     GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_FLUSH_EXPLICIT_BIT |
+                         GL_MAP_UNSYNCHRONIZED_BIT);
     ASSERT_GL_NO_ERROR();
 }
 

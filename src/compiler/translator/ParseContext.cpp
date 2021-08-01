@@ -553,7 +553,7 @@ bool TParseContext::checkCanBeLValue(const TSourceLoc &line, const char *op, TIn
         case EvqConst:
             message = "can't modify a const";
             break;
-        case EvqConstReadOnly:
+        case EvqParamConst:
             message = "can't modify a const";
             break;
         case EvqAttribute:
@@ -1031,7 +1031,7 @@ void TParseContext::checkOutParameterIsNotOpaqueType(const TSourceLoc &line,
                                                      TQualifier qualifier,
                                                      const TType &type)
 {
-    ASSERT(qualifier == EvqOut || qualifier == EvqInOut);
+    ASSERT(qualifier == EvqParamOut || qualifier == EvqParamInOut);
     if (IsOpaqueType(type.getBasicType()))
     {
         error(line, "opaque types cannot be output parameters", type.getBasicString());
@@ -1392,7 +1392,7 @@ void TParseContext::checkIsParameterQualifierValid(
     // The only parameter qualifiers a parameter can have are in, out, inout or const.
     TTypeQualifier typeQualifier = typeQualifierBuilder.getParameterTypeQualifier(mDiagnostics);
 
-    if (typeQualifier.qualifier == EvqOut || typeQualifier.qualifier == EvqInOut)
+    if (typeQualifier.qualifier == EvqParamOut || typeQualifier.qualifier == EvqParamInOut)
     {
         checkOutParameterIsNotOpaqueType(line, typeQualifier.qualifier, *type);
     }
@@ -2032,8 +2032,8 @@ void TParseContext::functionCallRValueLValueErrorCheck(const TFunction *fnCandid
     {
         TQualifier qual        = fnCandidate->getParam(i)->getType().getQualifier();
         TIntermTyped *argument = (*(fnCall->getSequence()))[i]->getAsTyped();
-        bool argumentIsRead = (IsQualifierUnspecified(qual) || qual == EvqIn || qual == EvqInOut ||
-                               qual == EvqConstReadOnly);
+        bool argumentIsRead    = (IsQualifierUnspecified(qual) || qual == EvqParamIn ||
+                               qual == EvqParamInOut || qual == EvqParamConst);
         if (argumentIsRead)
         {
             markStaticReadIfSymbol(argument);
@@ -2048,7 +2048,7 @@ void TParseContext::functionCallRValueLValueErrorCheck(const TFunction *fnCandid
                 }
             }
         }
-        if (qual == EvqOut || qual == EvqInOut)
+        if (qual == EvqParamOut || qual == EvqParamInOut)
         {
             if (!checkCanBeLValue(argument->getLine(), "assign", argument))
             {
@@ -2806,42 +2806,46 @@ void TParseContext::checkTessellationShaderUnsizedArraysAndSetSize(const TSource
             case EvqSmoothOut:
             case EvqSampleOut:
                 // Declaring an array size is optional. If no size is specified, it will be taken
-                // from output patch size declared in the shader.
-                type->sizeOutermostUnsizedArray(mTessControlShaderOutputVertices);
+                // from output patch size declared in the shader.  If the patch size is not yet
+                // declared, this is deferred until such time as it does.
+                if (mTessControlShaderOutputVertices == 0)
+                {
+                    mTessControlDeferredArrayTypesToSize.push_back(type);
+                }
+                else
+                {
+                    type->sizeOutermostUnsizedArray(mTessControlShaderOutputVertices);
+                }
                 break;
             default:
                 UNREACHABLE();
                 break;
         }
-    }
-    else
-    {
-        if (IsTessellationControlShaderInput(mShaderType, qualifier) ||
-            IsTessellationEvaluationShaderInput(mShaderType, qualifier))
-        {
-            if (outermostSize != static_cast<unsigned int>(mMaxPatchVertices))
-            {
-                error(
-                    location,
-                    "If a size is specified for a tessellation control or evaluation user-defined "
-                    "input variable, it must match the maximum patch size (gl_MaxPatchVertices).",
-                    token);
-            }
-        }
-        else if (IsTessellationControlShaderOutput(mShaderType, qualifier))
-        {
-            if (outermostSize != static_cast<unsigned int>(mTessControlShaderOutputVertices) &&
-                mTessControlShaderOutputVertices != 0)
-            {
-                error(location,
-                      "If a size is specified for a tessellation control user-defined per-vertex "
-                      "output variable, it must match the the number of vertices in the output "
-                      "patch.",
-                      token);
-            }
-        }
-
         return;
+    }
+
+    if (IsTessellationControlShaderInput(mShaderType, qualifier) ||
+        IsTessellationEvaluationShaderInput(mShaderType, qualifier))
+    {
+        if (outermostSize != static_cast<unsigned int>(mMaxPatchVertices))
+        {
+            error(location,
+                  "If a size is specified for a tessellation control or evaluation user-defined "
+                  "input variable, it must match the maximum patch size (gl_MaxPatchVertices).",
+                  token);
+        }
+    }
+    else if (IsTessellationControlShaderOutput(mShaderType, qualifier))
+    {
+        if (outermostSize != static_cast<unsigned int>(mTessControlShaderOutputVertices) &&
+            mTessControlShaderOutputVertices != 0)
+        {
+            error(location,
+                  "If a size is specified for a tessellation control user-defined per-vertex "
+                  "output variable, it must match the the number of vertices in the output "
+                  "patch.",
+                  token);
+        }
     }
 }
 
@@ -3456,6 +3460,12 @@ bool TParseContext::parseTessControlShaderOutputLayoutQualifier(const TTypeQuali
     if (mTessControlShaderOutputVertices == 0)
     {
         mTessControlShaderOutputVertices = layoutQualifier.vertices;
+
+        // Size any implicitly sized arrays that have already been declared.
+        for (TType *type : mTessControlDeferredArrayTypesToSize)
+        {
+            type->sizeOutermostUnsizedArray(mTessControlShaderOutputVertices);
+        }
     }
     else
     {
@@ -4261,7 +4271,12 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
                       getQualifierString(typeQualifier.qualifier));
             }
 
-            if (mShaderType == GL_TESS_CONTROL_SHADER && arraySizes == nullptr)
+            // Both inputs and outputs of tessellation control shaders must be arrays.
+            // For tessellation evaluation shaders, only inputs must necessarily be arrays.
+            const bool isTCS = mShaderType == GL_TESS_CONTROL_SHADER;
+            const bool isTESIn =
+                mShaderType == GL_TESS_EVALUATION_SHADER && IsShaderIn(typeQualifier.qualifier);
+            if (arraySizes == nullptr && (isTCS || isTESIn))
             {
                 error(typeQualifier.line, "type must be an array", blockName);
             }
@@ -4525,6 +4540,10 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
     if (arraySizes)
     {
         interfaceBlockType->makeArrays(*arraySizes);
+
+        checkGeometryShaderInputAndSetArraySize(instanceLine, instanceName, interfaceBlockType);
+        checkTessellationShaderUnsizedArraysAndSetSize(instanceLine, instanceName,
+                                                       interfaceBlockType);
     }
 
     // The instance variable gets created to refer to the interface block type from the AST
@@ -5446,7 +5465,7 @@ TStorageQualifierWrapper *TParseContext::parseInQualifier(const TSourceLoc &loc)
 {
     if (declaringFunction())
     {
-        return new TStorageQualifierWrapper(EvqIn, loc);
+        return new TStorageQualifierWrapper(EvqParamIn, loc);
     }
 
     switch (getShaderType())
@@ -5496,7 +5515,7 @@ TStorageQualifierWrapper *TParseContext::parseOutQualifier(const TSourceLoc &loc
 {
     if (declaringFunction())
     {
-        return new TStorageQualifierWrapper(EvqOut, loc);
+        return new TStorageQualifierWrapper(EvqParamOut, loc);
     }
     switch (getShaderType())
     {
@@ -5519,7 +5538,7 @@ TStorageQualifierWrapper *TParseContext::parseOutQualifier(const TSourceLoc &loc
         case GL_COMPUTE_SHADER:
         {
             error(loc, "storage qualifier isn't supported in compute shaders", "out");
-            return new TStorageQualifierWrapper(EvqOut, loc);
+            return new TStorageQualifierWrapper(EvqParamOut, loc);
         }
         case GL_GEOMETRY_SHADER_EXT:
         {
@@ -5556,7 +5575,7 @@ TStorageQualifierWrapper *TParseContext::parseInOutQualifier(const TSourceLoc &l
               "fetching input attachment data",
               "inout");
     }
-    return new TStorageQualifierWrapper(EvqInOut, loc);
+    return new TStorageQualifierWrapper(EvqParamInOut, loc);
 }
 
 TLayoutQualifier TParseContext::joinLayoutQualifiers(TLayoutQualifier leftQualifier,

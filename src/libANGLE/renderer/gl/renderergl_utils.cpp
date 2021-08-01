@@ -170,6 +170,13 @@ bool IsAndroidEmulator(const FunctionsGL *functions)
     return angle::BeginsWith(nativeGLRenderer, androidEmulator);
 }
 
+bool IsPowerVrRogue(const FunctionsGL *functions)
+{
+    constexpr char powerVRRogue[] = "PowerVR Rogue";
+    const char *nativeGLRenderer  = GetString(functions, GL_RENDERER);
+    return angle::BeginsWith(nativeGLRenderer, powerVRRogue);
+}
+
 void ClearErrors(const FunctionsGL *functions,
                  const char *file,
                  const char *function,
@@ -1424,10 +1431,8 @@ void GenerateCaps(const FunctionsGL *functions,
         // GL_MAX_ARRAY_TEXTURE_LAYERS is guaranteed to be at least 256.
         const int maxLayers = QuerySingleGLInt(functions, GL_MAX_ARRAY_TEXTURE_LAYERS);
         // GL_MAX_VIEWPORTS is guaranteed to be at least 16.
-        const int maxViewports = QuerySingleGLInt(functions, GL_MAX_VIEWPORTS);
-        extensions->maxViews   = static_cast<GLuint>(
-            std::min(static_cast<int>(gl::IMPLEMENTATION_ANGLE_MULTIVIEW_MAX_VIEWS),
-                     std::min(maxLayers, maxViewports)));
+        const int maxViewports       = QuerySingleGLInt(functions, GL_MAX_VIEWPORTS);
+        extensions->maxViews         = static_cast<GLuint>(std::min(maxLayers, maxViewports));
         *multiviewImplementationType = MultiviewImplementationTypeGL::NV_VIEWPORT_ARRAY2;
     }
 
@@ -1880,7 +1885,7 @@ void InitializeFeatures(const FunctionsGL *functions, angle::FeaturesGL *feature
         isIntel && IsApple() && IsSkylake(device) && GetMacOSVersion() < OSVersion(10, 13, 2));
 
     ANGLE_FEATURE_CONDITION(features, doesSRGBClearsOnLinearFramebufferAttachments,
-                            functions->standard == STANDARD_GL_DESKTOP && (isIntel || isAMD));
+                            isIntel || isAMD);
 
     ANGLE_FEATURE_CONDITION(features, emulateMaxVertexAttribStride,
                             IsLinux() && functions->standard == STANDARD_GL_DESKTOP && isAMD);
@@ -2022,7 +2027,7 @@ void InitializeFeatures(const FunctionsGL *functions, angle::FeaturesGL *feature
 
     // Workaround for the widespread OpenGL ES driver implementaion bug
     ANGLE_FEATURE_CONDITION(features, readPixelsUsingImplementationColorReadFormatForNorm16,
-                            functions->standard == STANDARD_GL_ES &&
+                            !isIntel && functions->standard == STANDARD_GL_ES &&
                                 functions->isAtLeastGLES(gl::Version(3, 1)) &&
                                 functions->hasGLESExtension("GL_EXT_texture_norm16"));
 
@@ -2105,9 +2110,10 @@ void InitializeFeatures(const FunctionsGL *functions, angle::FeaturesGL *feature
     // http://crbug.com/1137851
     // Speculative fix for above issue, users can enable it via flags.
     // http://crbug.com/1187475
-    // Disable on Mesa 20 / Intel
-    ANGLE_FEATURE_CONDITION(features, disableSyncControlSupport,
-                            IsLinux() && isIntel && isMesa && mesaVersion[0] == 20);
+    // Disable on Intel due to crashes in Mesa.
+    // http://anglebug.com/6174
+    // Disabled everywhere due to a bug in detecting Intel platforms on dual-GPU systems.
+    ANGLE_FEATURE_CONDITION(features, disableSyncControlSupport, IsLinux());
 
     ANGLE_FEATURE_CONDITION(features, keepBufferShadowCopy, !CanMapBufferForRead(functions));
 
@@ -2179,6 +2185,9 @@ void InitializeFrontendFeatures(const FunctionsGL *functions, angle::FrontendFea
     ANGLE_FEATURE_CONDITION(features, disableProgramCachingForTransformFeedback,
                             IsAndroid() && isQualcomm);
     ANGLE_FEATURE_CONDITION(features, syncFramebufferBindingsOnTexImage, false);
+    // https://crbug.com/480992
+    // Disable shader program cache to workaround PowerVR Rogue issues.
+    ANGLE_FEATURE_CONDITION(features, disableProgramBinary, IsPowerVrRogue(functions));
 }
 
 void ReInitializeFeaturesAtGPUSwitch(const FunctionsGL *functions, angle::FeaturesGL *features)

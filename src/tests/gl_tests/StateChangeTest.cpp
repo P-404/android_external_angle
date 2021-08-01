@@ -1728,7 +1728,7 @@ TEST_P(SimpleStateChangeTest, DrawArraysThenDrawElements)
         glClear(GL_COLOR_BUFFER_BIT);
         glDrawArrays(GL_TRIANGLES, 0, 3);                             // triangle to the left
         glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, nullptr);  // triangle to the right
-        swapBuffers();
+        glFinish();
     }
     glDisableVertexAttribArray(positionLocation);
 
@@ -2096,6 +2096,8 @@ TEST_P(SimpleStateChangeTest, DrawRepeatUnalignedVboChange)
 {
     // http://anglebug.com/4470
     ANGLE_SKIP_TEST_IF(isSwiftshader() && (IsWindows() || IsLinux()));
+    // http://anglebug.com/6171
+    ANGLE_SKIP_TEST_IF(IsOSX() && IsARM64() && IsMetal());
 
     const int kRepeat = 2;
 
@@ -5213,7 +5215,7 @@ TEST_P(WebGLComputeValidationStateChangeTest, DrawPastEndOfBufferWithDivisor)
 }
 
 // Tests state changes with uniform block validation.
-TEST_P(ValidationStateChangeTest, UniformBlockNegativeAPI)
+TEST_P(WebGL2ValidationStateChangeTest, UniformBlockNegativeAPI)
 {
     constexpr char kVS[] = R"(#version 300 es
 in vec2 position;

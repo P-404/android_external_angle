@@ -354,6 +354,7 @@ constexpr char kReuseDisplays[]                  = "--reuse-displays";
 constexpr char kEnableANGLEPerTestCaptureLabel[] = "--angle-per-test-capture-label";
 constexpr char kBatchId[]                        = "--batch-id=";
 constexpr char kDelayTestStart[]                 = "--delay-test-start=";
+constexpr char kRenderDoc[]                      = "--renderdoc";
 
 void SetupEnvironmentVarsForCaptureReplay()
 {
@@ -377,6 +378,8 @@ void SetTestStartDelay(const char *testStartDelay)
 {
     gTestStartDelaySeconds = std::stoi(testStartDelay);
 }
+
+bool gEnableRenderDocCapture = false;
 
 // static
 std::array<Vector3, 6> ANGLETestBase::GetQuadVertices()
@@ -423,6 +426,11 @@ ANGLETestBase::ANGLETestBase(const PlatformParameters &params)
 #else
         withMethods.eglParameters.debugLayersEnabled = false;
 #endif
+    }
+
+    if (gEnableRenderDocCapture)
+    {
+        mRenderDoc.attach();
     }
 
     auto iter = gFixtures.find(withMethods);
@@ -561,7 +569,7 @@ void ANGLETestBase::ANGLETestSetUp()
 
     angle::GPUTestConfig::API api = GetTestConfigAPIFromRenderer(mCurrentParams->getRenderer(),
                                                                  mCurrentParams->getDeviceType());
-    GPUTestConfig testConfig      = GPUTestConfig(api, 0);
+    GPUTestConfig testConfig      = GPUTestConfig(api, 0, false);
 
     std::stringstream fullTestNameStr;
     fullTestNameStr << testInfo->test_case_name() << "." << testInfo->name();
@@ -573,7 +581,6 @@ void ANGLETestBase::ANGLETestSetUp()
     if (testExpectation == GPUTestExpectationsParser::kGpuTestSkip)
     {
         GTEST_SKIP() << "Test skipped on this config";
-        return;
     }
 
     if (IsWindows())
@@ -684,6 +691,17 @@ void ANGLETestBase::ANGLETestSetUp()
     glViewport(0, 0, mWidth, mHeight);
 
     mIsSetUp = true;
+
+    mRenderDoc.startFrame();
+}
+
+void ANGLETestBase::ANGLETestPreTearDown()
+{
+    // We swap an extra time before we call "tearDown" to capture resources before they're freed.
+    if (gEnableANGLEPerTestCaptureLabel)
+    {
+        swapBuffers();
+    }
 }
 
 void ANGLETestBase::ANGLETestTearDown()
@@ -699,11 +717,14 @@ void ANGLETestBase::ANGLETestTearDown()
 
     if (mCurrentParams->noFixture || !mFixture->osWindow->valid())
     {
+        mRenderDoc.endFrame();
         return;
     }
 
     swapBuffers();
     mFixture->osWindow->messageLoop();
+
+    mRenderDoc.endFrame();
 
     if (mFixture->eglWindow)
     {
@@ -979,6 +1000,8 @@ void ANGLETestBase::drawIndexedQuad(GLuint program,
                                     GLfloat positionAttribZ,
                                     GLfloat positionAttribXYScale)
 {
+    ASSERT(!mFixture->configParams.webGLCompatibility.valid() ||
+           !mFixture->configParams.webGLCompatibility.value());
     drawIndexedQuad(program, positionAttribName, positionAttribZ, positionAttribXYScale, false);
 }
 
@@ -1462,8 +1485,7 @@ Library *ANGLETestEnvironment::GetAngleEGLLibrary()
 #if defined(ANGLE_USE_UTIL_LOADER)
     if (!gAngleEGLLibrary)
     {
-        gAngleEGLLibrary.reset(
-            OpenSharedLibrary(ANGLE_EGL_LIBRARY_NAME, SearchType::ApplicationDir));
+        gAngleEGLLibrary.reset(OpenSharedLibrary(ANGLE_EGL_LIBRARY_NAME, SearchType::ModuleDir));
     }
 #endif  // defined(ANGLE_USE_UTIL_LOADER)
     return gAngleEGLLibrary.get();
@@ -1475,8 +1497,8 @@ Library *ANGLETestEnvironment::GetSystemEGLLibrary()
 #if defined(ANGLE_USE_UTIL_LOADER)
     if (!gSystemEGLLibrary)
     {
-        gSystemEGLLibrary.reset(
-            OpenSharedLibraryWithExtension(GetNativeEGLLibraryNameWithExtension()));
+        gSystemEGLLibrary.reset(OpenSharedLibraryWithExtension(
+            GetNativeEGLLibraryNameWithExtension(), SearchType::SystemDir));
     }
 #endif  // defined(ANGLE_USE_UTIL_LOADER)
     return gSystemEGLLibrary.get();
@@ -1521,6 +1543,10 @@ void ANGLEProcessTestArgs(int *argc, char *argv[])
         else if (strncmp(argv[argIndex], kDelayTestStart, strlen(kDelayTestStart)) == 0)
         {
             SetTestStartDelay(argv[argIndex] + strlen(kDelayTestStart));
+        }
+        else if (strncmp(argv[argIndex], kRenderDoc, strlen(kRenderDoc)) == 0)
+        {
+            gEnableRenderDocCapture = true;
         }
     }
 }

@@ -53,8 +53,16 @@ class ValidateAST : public TIntermTraverser
     // Visit a structure or interface block, and recursively visit its fields of structure type.
     void visitStructOrInterfaceBlockDeclaration(const TType &type, const TSourceLoc &location);
     void visitStructInDeclarationUsage(const TType &type, const TSourceLoc &location);
-    // Visit a unary or aggregate node and validate it's built-in op against it's built-in function.
+    // Visit a unary or aggregate node and validate its built-in op against its built-in function.
     void visitBuiltIn(TIntermOperator *op, const TFunction *function);
+    // Visit an aggregate node and validate its function call is to one that's already defined.
+    void visitFunctionCall(TIntermAggregate *node);
+    // Visit a binary node and validate its type against its operands.
+    void validateExpressionTypeBinary(TIntermBinary *node);
+    // Visit a symbol node and validate it's declared previously.
+    void visitVariableNeedingDeclaration(TIntermSymbol *node);
+    // Visit a built-in symbol node and validate it's consistently used across the tree.
+    void visitBuiltInVariable(TIntermSymbol *node);
 
     void scope(Visit visit);
     bool isVariableDeclared(const TVariable *variable);
@@ -76,21 +84,43 @@ class ValidateAST : public TIntermTraverser
     // For validateVariableReferences:
     std::vector<std::set<const TVariable *>> mDeclaredVariables;
     std::set<const TInterfaceBlock *> mNamelessInterfaceBlocks;
+    std::map<ImmutableString, const TVariable *> mReferencedBuiltIns;
     bool mVariableReferencesFailed = false;
 
     // For validateBuiltInOps:
     bool mBuiltInOpsFailed = false;
 
+    // For validateFunctionCall:
+    std::set<const TFunction *> mDeclaredFunctions;
+    bool mFunctionCallFailed = false;
+
+    // For validateNoRawFunctionCalls:
+    bool mNoRawFunctionCallsFailed = false;
+
     // For validateNullNodes:
     bool mNullNodesFailed = false;
+
+    // For validateQualifiers:
+    bool mQualifiersFailed = false;
 
     // For validateStructUsage:
     std::vector<std::map<ImmutableString, const TFieldListCollection *>> mStructsAndBlocksByName;
     bool mStructUsageFailed = false;
 
+    // For validateExpressionTypes:
+    bool mExpressionTypesFailed = false;
+
     // For validateMultiDeclarations:
     bool mMultiDeclarationsFailed = false;
 };
+
+bool IsSameType(const TType &a, const TType &b)
+{
+    return a.getBasicType() == b.getBasicType() && a.getNominalSize() == b.getNominalSize() &&
+           a.getSecondarySize() == b.getSecondarySize() && a.getArraySizes() == b.getArraySizes() &&
+           a.getStruct() == b.getStruct() &&
+           (!a.isInterfaceBlock() || a.getInterfaceBlock() == b.getInterfaceBlock());
+}
 
 bool ValidateAST::validate(TIntermNode *root,
                            TDiagnostics *diagnostics,
@@ -112,6 +142,7 @@ ValidateAST::ValidateAST(TIntermNode *root,
     if (!isTreeRoot)
     {
         mOptions.validateVariableReferences = false;
+        mOptions.validateFunctionCall       = false;
     }
 
     if (mOptions.validateSingleParent)
@@ -160,6 +191,20 @@ void ValidateAST::visitStructOrInterfaceBlockDeclaration(const TType &type,
     if (structOrBlock)
     {
         ASSERT(!typeName.empty());
+
+        // Allow gl_PerVertex to be doubly-defined.
+        if (typeName == "gl_PerVertex")
+        {
+            if (IsShaderIn(type.getQualifier()))
+            {
+                typeName = ImmutableString("gl_PerVertex<input>");
+            }
+            else
+            {
+                ASSERT(IsShaderOut(type.getQualifier()));
+                typeName = ImmutableString("gl_PerVertex<output>");
+            }
+        }
 
         if (mStructsAndBlocksByName.back().find(typeName) != mStructsAndBlocksByName.back().end())
         {
@@ -263,6 +308,156 @@ void ValidateAST::visitBuiltIn(TIntermOperator *node, const TFunction *function)
                             "Found node calling built-in with a reference to a different function "
                             "<validateBuiltInOps>",
                             opValue.data());
+        mVariableReferencesFailed = true;
+    }
+}
+
+void ValidateAST::visitFunctionCall(TIntermAggregate *node)
+{
+    if (node->getOp() != EOpCallFunctionInAST)
+    {
+        return;
+    }
+
+    const TFunction *function = node->getFunction();
+
+    if (function == nullptr)
+    {
+        mDiagnostics->error(node->getLine(),
+                            "Found node calling function without a reference to it",
+                            "<validateFunctionCall>");
+        mFunctionCallFailed = true;
+    }
+    else if (mDeclaredFunctions.find(function) == mDeclaredFunctions.end())
+    {
+        mDiagnostics->error(node->getLine(),
+                            "Found node calling previously undeclared function "
+                            "<validateFunctionCall>",
+                            function->name().data());
+        mFunctionCallFailed = true;
+    }
+}
+
+void ValidateAST::validateExpressionTypeBinary(TIntermBinary *node)
+{
+    switch (node->getOp())
+    {
+        case EOpIndexDirect:
+        case EOpIndexIndirect:
+        {
+            TType expectedType(node->getLeft()->getType());
+            if (!expectedType.isArray())
+            {
+                // TODO: Validate matrix column selection and vector component selection.
+                // http://anglebug.com/2733
+                break;
+            }
+
+            expectedType.toArrayElementType();
+
+            if (!IsSameType(node->getType(), expectedType))
+            {
+                const TSymbol *symbol = expectedType.getStruct();
+                if (symbol == nullptr)
+                {
+                    symbol = expectedType.getInterfaceBlock();
+                }
+                const char *name = nullptr;
+                if (symbol)
+                {
+                    name = symbol->name().data();
+                }
+                else if (expectedType.isScalar())
+                {
+                    name = "<scalar array>";
+                }
+                else if (expectedType.isVector())
+                {
+                    name = "<vector array>";
+                }
+                else
+                {
+                    ASSERT(expectedType.isMatrix());
+                    name = "<matrix array>";
+                }
+
+                mDiagnostics->error(
+                    node->getLine(),
+                    "Found index node with type that is inconsistent with the array being indexed "
+                    "<validateExpressionTypes>",
+                    name);
+                mExpressionTypesFailed = true;
+            }
+        }
+        break;
+        default:
+            // TODO: Validate other expressions. http://anglebug.com/2733
+            break;
+    }
+}
+
+void ValidateAST::visitVariableNeedingDeclaration(TIntermSymbol *node)
+{
+    const TVariable *variable = &node->variable();
+    const TType &type         = node->getType();
+
+    // If it's a reference to a field of a nameless interface block, match it by index and name.
+    if (type.getInterfaceBlock() && !type.isInterfaceBlock())
+    {
+        const TInterfaceBlock *interfaceBlock = type.getInterfaceBlock();
+        const TFieldList &fieldList           = interfaceBlock->fields();
+        const size_t fieldIndex               = type.getInterfaceBlockFieldIndex();
+
+        if (mNamelessInterfaceBlocks.count(interfaceBlock) == 0)
+        {
+            mDiagnostics->error(node->getLine(),
+                                "Found reference to undeclared or inconsistenly transformed "
+                                "nameless interface block <validateVariableReferences>",
+                                node->getName().data());
+            mVariableReferencesFailed = true;
+        }
+        else if (fieldIndex >= fieldList.size() || node->getName() != fieldList[fieldIndex]->name())
+        {
+            mDiagnostics->error(node->getLine(),
+                                "Found reference to inconsistenly transformed nameless "
+                                "interface block field <validateVariableReferences>",
+                                node->getName().data());
+            mVariableReferencesFailed = true;
+        }
+        return;
+    }
+
+    const bool isStructDeclaration =
+        type.isStructSpecifier() && variable->symbolType() == SymbolType::Empty;
+
+    if (!isStructDeclaration && !isVariableDeclared(variable))
+    {
+        mDiagnostics->error(node->getLine(),
+                            "Found reference to undeclared or inconsistently transformed "
+                            "variable <validateVariableReferences>",
+                            node->getName().data());
+        mVariableReferencesFailed = true;
+    }
+}
+
+void ValidateAST::visitBuiltInVariable(TIntermSymbol *node)
+{
+    const TVariable *variable = &node->variable();
+    ImmutableString name      = variable->name();
+
+    auto iter = mReferencedBuiltIns.find(name);
+    if (iter == mReferencedBuiltIns.end())
+    {
+        mReferencedBuiltIns[name] = variable;
+        return;
+    }
+
+    if (variable != iter->second)
+    {
+        mDiagnostics->error(
+            node->getLine(),
+            "Found inconsistent references to built-in variable <validateVariableReferences>",
+            name.data());
         mVariableReferencesFailed = true;
     }
 }
@@ -378,48 +573,16 @@ void ValidateAST::visitSymbol(TIntermSymbol *node)
     visitNode(PreVisit, node);
 
     const TVariable *variable = &node->variable();
-    const TType &type         = node->getType();
 
-    if (mOptions.validateVariableReferences && variableNeedsDeclaration(variable))
+    if (mOptions.validateVariableReferences)
     {
-        // If it's a reference to a field of a nameless interface block, match it by index and name.
-        if (type.getInterfaceBlock() && !type.isInterfaceBlock())
+        if (variableNeedsDeclaration(variable))
         {
-            const TInterfaceBlock *interfaceBlock = type.getInterfaceBlock();
-            const TFieldList &fieldList           = interfaceBlock->fields();
-            const size_t fieldIndex               = type.getInterfaceBlockFieldIndex();
-
-            if (mNamelessInterfaceBlocks.count(interfaceBlock) == 0)
-            {
-                mDiagnostics->error(node->getLine(),
-                                    "Found reference to undeclared or inconsistenly transformed "
-                                    "nameless interface block <validateVariableReferences>",
-                                    node->getName().data());
-                mVariableReferencesFailed = true;
-            }
-            else if (fieldIndex >= fieldList.size() ||
-                     node->getName() != fieldList[fieldIndex]->name())
-            {
-                mDiagnostics->error(node->getLine(),
-                                    "Found reference to inconsistenly transformed nameless "
-                                    "interface block field <validateVariableReferences>",
-                                    node->getName().data());
-                mVariableReferencesFailed = true;
-            }
+            visitVariableNeedingDeclaration(node);
         }
-        else
+        else if (variable->name().beginsWith("gl_"))
         {
-            const bool isStructDeclaration =
-                type.isStructSpecifier() && variable->symbolType() == SymbolType::Empty;
-
-            if (!isStructDeclaration && !isVariableDeclared(variable))
-            {
-                mDiagnostics->error(node->getLine(),
-                                    "Found reference to undeclared or inconsistently transformed "
-                                    "variable <validateVariableReferences>",
-                                    node->getName().data());
-                mVariableReferencesFailed = true;
-            }
+            visitBuiltInVariable(node);
         }
     }
 }
@@ -438,6 +601,12 @@ bool ValidateAST::visitSwizzle(Visit visit, TIntermSwizzle *node)
 bool ValidateAST::visitBinary(Visit visit, TIntermBinary *node)
 {
     visitNode(visit, node);
+
+    if (mOptions.validateExpressionTypes && visit == PreVisit)
+    {
+        validateExpressionTypeBinary(node);
+    }
+
     return true;
 }
 
@@ -480,6 +649,32 @@ bool ValidateAST::visitCase(Visit visit, TIntermCase *node)
 void ValidateAST::visitFunctionPrototype(TIntermFunctionPrototype *node)
 {
     visitNode(PreVisit, node);
+
+    if (mOptions.validateFunctionCall)
+    {
+        const TFunction *function = node->getFunction();
+        mDeclaredFunctions.insert(function);
+    }
+
+    if (mOptions.validateQualifiers)
+    {
+        const TFunction *function = node->getFunction();
+        for (size_t paramIndex = 0; paramIndex < function->getParamCount(); ++paramIndex)
+        {
+            const TVariable *param = function->getParam(paramIndex);
+            TQualifier qualifier   = param->getType().getQualifier();
+
+            if (qualifier != EvqParamIn && qualifier != EvqParamOut && qualifier != EvqParamInOut &&
+                qualifier != EvqParamConst)
+            {
+                mDiagnostics->error(node->getLine(),
+                                    "Found function prototype with an invalid qualifier "
+                                    "<validateQualifiers>",
+                                    param->name().data());
+                mQualifiersFailed = true;
+            }
+        }
+    }
 }
 
 bool ValidateAST::visitFunctionDefinition(Visit visit, TIntermFunctionDefinition *node)
@@ -521,6 +716,23 @@ bool ValidateAST::visitAggregate(Visit visit, TIntermAggregate *node)
     if (visit == PreVisit && mOptions.validateBuiltInOps)
     {
         visitBuiltIn(node, node->getFunction());
+    }
+
+    if (visit == PreVisit && mOptions.validateFunctionCall)
+    {
+        visitFunctionCall(node);
+    }
+
+    if (visit == PreVisit && mOptions.validateNoRawFunctionCalls)
+    {
+        if (node->getOp() == EOpCallInternalRawFunction)
+        {
+            mDiagnostics->error(node->getLine(),
+                                "Found node calling a raw function (deprecated) "
+                                "<validateNoRawFunctionCalls>",
+                                node->getFunction()->name().data());
+            mNoRawFunctionCallsFailed = true;
+        }
     }
 
     return true;
@@ -647,7 +859,9 @@ void ValidateAST::visitPreprocessorDirective(TIntermPreprocessorDirective *node)
 bool ValidateAST::validateInternal()
 {
     return !mSingleParentFailed && !mVariableReferencesFailed && !mBuiltInOpsFailed &&
-           !mNullNodesFailed && !mStructUsageFailed && !mMultiDeclarationsFailed;
+           !mFunctionCallFailed && !mNoRawFunctionCallsFailed && !mNullNodesFailed &&
+           !mQualifiersFailed && !mStructUsageFailed && !mExpressionTypesFailed &&
+           !mMultiDeclarationsFailed;
 }
 
 }  // anonymous namespace

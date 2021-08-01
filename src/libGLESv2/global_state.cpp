@@ -88,7 +88,8 @@ void SetGlobalLastContext(gl::Context *context)
 }
 
 // This function causes an MSAN false positive, which is muted. See https://crbug.com/1211047
-ANGLE_NO_SANITIZE_MEMORY Thread *GetCurrentThread()
+// It also causes a flaky false positive in TSAN. http://crbug.com/1223970
+ANGLE_NO_SANITIZE_MEMORY ANGLE_NO_SANITIZE_THREAD Thread *GetCurrentThread()
 {
     Thread *current = gCurrentThread;
     return (current ? current : AllocateCurrentThread());
@@ -96,13 +97,23 @@ ANGLE_NO_SANITIZE_MEMORY Thread *GetCurrentThread()
 
 void SetContextCurrent(Thread *thread, gl::Context *context)
 {
-    ASSERT(gCurrentThread);
-    gCurrentThread->setCurrent(context);
+    ASSERT(gCurrentThread == thread);
     SetContextToAndroidOpenGLTLSSlot(context);
     gl::gCurrentValidContext = context;
 #if defined(ANGLE_FORCE_CONTEXT_CHECK_EVERY_CALL)
     DirtyContextIfNeeded(context);
 #endif
+}
+
+ScopedSyncCurrentContextFromThread::ScopedSyncCurrentContextFromThread(egl::Thread *thread)
+    : mThread(thread)
+{
+    ASSERT(mThread);
+}
+
+ScopedSyncCurrentContextFromThread::~ScopedSyncCurrentContextFromThread()
+{
+    SetContextCurrent(mThread, mThread->getContext());
 }
 
 }  // namespace egl

@@ -405,6 +405,9 @@ TEST_P(MultisampledRenderToTextureTest, FramebufferCompleteness)
 {
     ANGLE_SKIP_TEST_IF(!EnsureGLExtensionEnabled("GL_EXT_multisampled_render_to_texture"));
 
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsMetal() && IsAMD());
+
     // Checking that Renderbuffer and texture2d having different number of samples results
     // in a FRAMEBUFFER_INCOMPLETE_MULTISAMPLE
     GLTexture texture;
@@ -479,6 +482,49 @@ TEST_P(MultisampledRenderToTextureTest, FramebufferCompleteness)
                                              texture, 0, maxSamples);
         EXPECT_GL_FRAMEBUFFER_COMPLETE(GL_FRAMEBUFFER);
     }
+}
+
+// Checking for framebuffer completeness using extension methods.
+TEST_P(MultisampledRenderToTextureTest, FramebufferCompletenessSmallSampleCount)
+{
+    ANGLE_SKIP_TEST_IF(!EnsureGLExtensionEnabled("GL_EXT_multisampled_render_to_texture"));
+
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsMetal() && IsAMD());
+
+    // A sample count of '2' can be rounded up to '4' on some systems (e.g., ARM+Android).
+    GLsizei samples = 2;
+
+    // Checking that Renderbuffer and texture2d having different number of samples results
+    // in a FRAMEBUFFER_INCOMPLETE_MULTISAMPLE
+    GLTexture texture;
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 64, 64, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    ASSERT_GL_NO_ERROR();
+
+    // Texture attachment for color attachment 0.  Framebuffer should be complete.
+    GLFramebuffer FBO;
+    glBindFramebuffer(GL_FRAMEBUFFER, FBO);
+    glFramebufferTexture2DMultisampleEXT(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                         texture, 0, samples);
+    EXPECT_GL_FRAMEBUFFER_COMPLETE(GL_FRAMEBUFFER);
+
+    // Depth/stencil renderbuffer, potentially with a different sample count.
+    GLRenderbuffer dsRenderbuffer;
+    glBindRenderbuffer(GL_RENDERBUFFER, dsRenderbuffer);
+    glRenderbufferStorageMultisampleEXT(GL_RENDERBUFFER, samples, GL_DEPTH_COMPONENT16, 64, 64);
+    ASSERT_GL_NO_ERROR();
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, dsRenderbuffer);
+    EXPECT_GL_FRAMEBUFFER_COMPLETE(GL_FRAMEBUFFER);
+
+    // Color renderbuffer for color attachment 0.
+    GLRenderbuffer colorRenderbuffer;
+    glBindRenderbuffer(GL_RENDERBUFFER, colorRenderbuffer);
+    glRenderbufferStorageMultisampleEXT(GL_RENDERBUFFER, samples, GL_RGBA4, 64, 64);
+    ASSERT_GL_NO_ERROR();
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER,
+                              colorRenderbuffer);
+    EXPECT_GL_FRAMEBUFFER_COMPLETE(GL_FRAMEBUFFER);
 }
 
 void MultisampledRenderToTextureTest::createAndAttachColorAttachment(
@@ -1211,6 +1257,9 @@ TEST_P(MultisampledRenderToTextureTest, DrawCopyThenBlend)
 // following draw should retain the data written by the first draw command.  Uses renderbuffer.
 TEST_P(MultisampledRenderToTextureTest, RenderbufferDrawCopyThenBlend)
 {
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsOSX() && IsARM64() && IsMetal());
+
     drawCopyThenBlendCommon(true);
 }
 
@@ -1308,6 +1357,9 @@ TEST_P(MultisampledRenderToTextureTest, ClearDrawCopyThenBlendSameProgram)
 // Same as ClearDrawCopyThenBlendSameProgram but with renderbuffers
 TEST_P(MultisampledRenderToTextureTest, RenderbufferClearDrawCopyThenBlendSameProgram)
 {
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsOSX() && IsARM64() && IsMetal());
+
     clearDrawCopyThenBlendSameProgramCommon(true);
 }
 
@@ -1320,6 +1372,9 @@ TEST_P(MultisampledRenderToTextureES3Test,
 
     // http://anglebug.com/5380
     ANGLE_SKIP_TEST_IF(IsLinux() && IsAMD() && IsVulkan());
+
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsOSX() && IsARM64() && IsMetal());
 
     constexpr GLsizei kSize = 64;
 
@@ -1711,6 +1766,12 @@ void MultisampledRenderToTextureES3Test::drawCopyDrawAttachDepthStencilClearThen
 // and render pass will result in an ASSERT.
 TEST_P(MultisampledRenderToTextureES3Test, DrawCopyDrawAttachDepthStencilClearThenDraw)
 {
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsMetal() && IsAMD());
+
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsOSX() && IsARM64() && IsMetal());
+
     drawCopyDrawAttachDepthStencilClearThenDrawCommon(false);
 }
 
@@ -2032,6 +2093,9 @@ TEST_P(MultisampledRenderToTextureES3Test, RenderbufferDepthStencilClearDrawCopy
     // http://anglebug.com/5380
     ANGLE_SKIP_TEST_IF(IsLinux() && IsAMD() && IsVulkan());
 
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsOSX() && IsARM64() && IsMetal());
+
     constexpr GLsizei kSize = 64;
 
     setupCopyTexProgram();
@@ -2126,6 +2190,9 @@ TEST_P(MultisampledRenderToTextureES3Test, RenderbufferDepthStencilDrawCopyClear
 
     // http://anglebug.com/5380
     ANGLE_SKIP_TEST_IF(IsLinux() && IsAMD() && IsVulkan());
+
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsOSX() && IsARM64() && IsMetal());
 
     constexpr GLsizei kSize = 64;
 
@@ -2474,6 +2541,9 @@ TEST_P(MultisampledRenderToTextureES3Test, RenderbufferDrawThenBlitDepthStencilO
     // http://anglebug.com/5110
     ANGLE_SKIP_TEST_IF(IsD3D());
 
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsOSX() && IsARM64() && IsMetal());
+
     constexpr GLsizei kSize = 64;
 
     GLFramebuffer fboMS;
@@ -2625,6 +2695,9 @@ TEST_P(MultisampledRenderToTextureTest, DepthReadWriteToggleWithStartedRenderPas
 
     // http://anglebug.com/5380
     ANGLE_SKIP_TEST_IF(IsLinux() && IsAMD() && IsVulkan());
+
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsOSX() && IsARM64() && IsMetal());
 
     constexpr GLsizei kSize = 64;
 
@@ -2918,6 +2991,9 @@ TEST_P(MultisampledRenderToTextureES3Test, ColorAttachments0And3)
 // Uses color attachments 0 and 3.  Uses renderbuffer.
 TEST_P(MultisampledRenderToTextureES3Test, RenderbufferColorAttachments0And3)
 {
+    // Test failure introduced by Apple's changes (anglebug.com/5505)
+    ANGLE_SKIP_TEST_IF(IsOSX() && IsARM64() && IsMetal());
+
     colorAttachments0And3Common(true);
 }
 

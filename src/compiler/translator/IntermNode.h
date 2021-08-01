@@ -146,6 +146,7 @@ class TIntermTyped : public TIntermNode
     // should only be used after nodes have been replaced with their folded versions returned
     // from fold(). hasConstantValue() returns true if getConstantValue() will return a value.
     virtual bool hasConstantValue() const;
+    virtual bool isConstantNullValue() const;
     virtual const TConstantUnion *getConstantValue() const;
 
     // True if executing the expression represented by this node affects state, like values of
@@ -328,6 +329,7 @@ class TIntermConstantUnion : public TIntermExpression
     TIntermTyped *deepCopy() const override { return new TIntermConstantUnion(*this); }
 
     bool hasConstantValue() const override;
+    bool isConstantNullValue() const override;
     const TConstantUnion *getConstantValue() const override;
 
     bool hasSideEffects() const override { return false; }
@@ -588,7 +590,7 @@ class TIntermAggregate : public TIntermOperator, public TIntermAggregateBase
     static TIntermAggregate *CreateRawFunctionCall(const TFunction &func,
                                                    TIntermSequence *arguments);
 
-    // This covers all built-in function calls - whether they are associated with an op or not.
+    // This covers all built-in function calls.
     static TIntermAggregate *CreateBuiltInFunctionCall(const TFunction &func,
                                                        TIntermSequence *arguments);
     static TIntermAggregate *CreateConstructor(const TType &type, TIntermSequence *arguments);
@@ -600,6 +602,7 @@ class TIntermAggregate : public TIntermOperator, public TIntermAggregateBase
     TIntermAggregate *shallowCopy() const;
 
     bool hasConstantValue() const override;
+    bool isConstantNullValue() const override;
     const TConstantUnion *getConstantValue() const override;
 
     TIntermAggregate *getAsAggregate() override { return this; }

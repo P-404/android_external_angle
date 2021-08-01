@@ -37,6 +37,7 @@ function generate_Android_bp_file() {
             "target_os = \"android\""
             "is_component_build = false"
             "is_debug = false"
+            "dcheck_always_on = false"
             "symbol_level = 0"
             "angle_standalone = false"
             "angle_build_all = false"
@@ -148,6 +149,11 @@ find third_party/ -maxdepth 2 -type d ! -path third_party/ \
     ! -path 'third_party/vulkan_memory_allocator*' \
     ! -path 'third_party/zlib*' \
     -print0 | xargs --null rm -rf
+# Special handling for zlib's contrib/ (third_party) folder, since there are some
+# missing license files.
+find third_party/zlib/contrib/ -maxdepth 1 -type d ! -path third_party/zlib/contrib/ \
+    ! -path 'third_party/zlib/contrib/optimizations*' \
+    -print0 | xargs --null rm -rf
 
 git add Android.bp
 
@@ -167,15 +173,21 @@ extra_removal_files=(
    "third_party/zlib/contrib/tests/OWNERS"
    "third_party/zlib/contrib/bench/OWNERS"
    "third_party/zlib/contrib/tests/fuzzers/OWNERS"
+   # Remove Android.mk files to prevent automated CLs:
+   #   "[LSC] Add LOCAL_LICENSE_KINDS to external/angle"
+   "Android.mk"
+   "third_party/vulkan-deps/glslang/src/Android.mk"
+   "third_party/vulkan-deps/glslang/src/ndk_test/Android.mk"
+   "third_party/vulkan-deps/spirv-tools/src/Android.mk"
+   "third_party/vulkan-deps/spirv-tools/src/android_test/Android.mk"
 )
 
 for removal_file in "${extra_removal_files[@]}"; do
    rm -f "$removal_file"
 done
 
-for dep in "${third_party_deps[@]}"; do
-   git add -f "$dep"
-done
+# Add all changes to third_party/ so we delete everything not explicitly allowed.
+git add -f "third_party/*"
 
 # Done with depot_tools
 rm -rf $DEPOT_TOOLS_DIR
